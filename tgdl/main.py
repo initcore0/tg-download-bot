@@ -1,13 +1,98 @@
 """Entrypoint: config, logging, DB init, aiogram polling.
 
-STUB — implemented by Agent B (M2).
-Must fail fast with a clear one-line error if TELEGRAM_BOT_TOKEN is missing.
+Fails fast with a clear one-line error if TELEGRAM_BOT_TOKEN is missing.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import sys
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from tgdl.bot import handlers, runtime
+from tgdl.config import Settings, load_settings
+from tgdl.storage import repo
+
+log = logging.getLogger("tgdl")
+
+#: We only ever need these two update types (ARCHITECTURE.md §7).
+ALLOWED_UPDATES = ["message", "channel_post"]
+
+
+async def _resolve_username(bot: Bot) -> str | None:
+    """Cache the bot's @username so group/channel mention matching works."""
+    try:
+        me = await bot.me()
+        runtime.set_bot_username(me.username)
+        log.info("running as @%s (id=%s)", me.username, me.id)
+        return me.username
+    except Exception:
+        log.exception("could not resolve bot username; mention handling may not work")
+        return None
+
+
+async def run(settings: Settings) -> None:
+    """Async entrypoint: init DB, start long polling, shut down cleanly."""
+    try:
+        await repo.init_db(settings.database_path)
+    except NotImplementedError:
+        log.warning("storage layer not implemented yet (M3) — running without audit DB")
+    except Exception:
+        log.exception("database init failed")
+        raise
+
+    bot = Bot(
+        token=settings.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(handlers.router)
+
+    # Injected into every handler as the `settings` kwarg.
+    dp["settings"] = settings
+
+    runtime.configure(settings.max_concurrent_downloads)
+    await _resolve_username(bot)
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, handle_signals=True)
+    finally:
+        try:
+            await repo.close_db()
+        except NotImplementedError:
+            pass
+        except Exception:
+            log.exception("error closing database")
+        try:
+            await bot.session.close()
+        except Exception:
+            log.exception("error closing bot session")
+
 
 def main() -> None:
-    raise NotImplementedError("M2 — Agent B")
+    settings = load_settings()
+
+    if not settings.telegram_bot_token.strip():
+        print(
+            "ERROR: TELEGRAM_BOT_TOKEN is not set. "
+            "Put it in your environment or a .env file (see .env.example).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+    try:
+        asyncio.run(run(settings))
+    except (KeyboardInterrupt, SystemExit):
+        log.info("shutting down")
 
 
 if __name__ == "__main__":
