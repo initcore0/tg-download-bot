@@ -12,6 +12,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramUnauthorizedError
+from sqlalchemy.exc import OperationalError
 
 from tgdl.bot import handlers, runtime
 from tgdl.config import Settings, load_settings
@@ -44,6 +45,16 @@ async def run(settings: Settings) -> None:
     """Async entrypoint: init DB, start long polling, shut down cleanly."""
     try:
         await repo.init_db(settings.database_path)
+    except (OperationalError, OSError) as exc:
+        raise SystemExit(
+            f"ERROR: cannot open the SQLite database at {settings.database_path} "
+            f"({getattr(exc, 'orig', None) or exc}). "
+            "The directory must exist and be writable by the bot "
+            "user (uid 10001 in Docker). If you mount a volume there, the stock "
+            "image fixes ownership automatically on start; otherwise run "
+            "`chown -R 10001:10001 <data dir>` on the host, or point "
+            "DATABASE_PATH somewhere writable."
+        ) from exc
     except Exception:
         log.exception("database init failed")
         raise

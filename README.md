@@ -79,6 +79,14 @@ To stop it:
 docker compose down
 ```
 
+### Hosted platforms (Coolify, Portainer, plain `docker run`)
+
+Deploy the image with `TELEGRAM_BOT_TOKEN` set and a persistent volume mounted at
+`/app/data`. Platforms usually create that volume owned by root; the entrypoint
+detects this on startup, fixes ownership, and then drops to the non-root bot user —
+no manual `chown` or init step is needed. The database schema is created
+automatically on first start.
+
 ## Configuration
 
 All settings are read from the environment or a `.env` file. Only the token is required.

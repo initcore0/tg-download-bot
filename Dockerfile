@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
 # ffmpeg/ffprobe are required by the downloader (remux + transcode).
+# gosu lets the entrypoint fix volume ownership as root, then drop privileges.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -25,11 +26,15 @@ COPY tgdl ./tgdl
 RUN uv sync --frozen --no-dev
 
 # Non-root runtime. `data` is the volume mount point for the SQLite DB + workdirs.
+# The container starts as root only so the entrypoint can chown mounted volumes
+# (hosted platforms create them root-owned), then drops to tgdl via gosu.
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN useradd --create-home --uid 10001 tgdl \
     && mkdir -p /app/data \
-    && chown -R tgdl:tgdl /app
-USER tgdl
+    && chown -R tgdl:tgdl /app \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 VOLUME ["/app/data"]
 
-ENTRYPOINT ["uv", "run", "--no-sync", "tgdl-bot"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["uv", "run", "--no-sync", "tgdl-bot"]
