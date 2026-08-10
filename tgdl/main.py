@@ -55,15 +55,21 @@ async def run(settings: Settings) -> None:
     try:
         await repo.init_db(settings.database_path)
     except (OperationalError, OSError) as exc:
-        raise SystemExit(
-            f"ERROR: cannot open the SQLite database at {settings.database_path} "
-            f"({getattr(exc, 'orig', None) or exc}). "
-            "The directory must exist and be writable by the bot "
-            "user (uid 10001 in Docker). If you mount a volume there, the stock "
-            "image fixes ownership automatically on start; otherwise run "
-            "`chown -R 10001:10001 <data dir>` on the host, or point "
-            "DATABASE_PATH somewhere writable."
-        ) from exc
+        detail = str(getattr(exc, "orig", None) or exc)
+        # Only the genuine can't-open-file case gets the permissions guidance;
+        # other operational errors (e.g. a failed migration) must not be
+        # mislabeled as a filesystem problem.
+        if "unable to open database file" in detail.lower():
+            raise SystemExit(
+                f"ERROR: cannot open the SQLite database at {settings.database_path} "
+                f"({detail}). The directory must exist and be writable by the bot "
+                "user (uid 10001 in Docker). If you mount a volume there, the stock "
+                "image fixes ownership automatically on start; otherwise run "
+                "`chown -R 10001:10001 <data dir>` on the host, or point "
+                "DATABASE_PATH somewhere writable."
+            ) from exc
+        log.exception("database initialization failed")
+        raise
     except Exception:
         log.exception("database init failed")
         raise

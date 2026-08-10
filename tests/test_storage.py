@@ -149,35 +149,43 @@ async def test_calls_before_init_raise():
 # --------------------------------------------------- legacy-data purge (migration)
 
 
+#: The exact pre-anonymity schema: `requests.user_id` is a REAL foreign key to
+#: `users`, which is what made the naive migration crash under FK enforcement.
+_LEGACY_SCHEMA = """
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY, telegram_id BIGINT, username TEXT,
+        first_name TEXT, last_name TEXT
+    );
+    INSERT INTO users (id, telegram_id, username) VALUES (1, 777, 'alice');
+    CREATE TABLE requests (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        chat_id BIGINT NOT NULL, message_id BIGINT,
+        chat_type TEXT NOT NULL,
+        url TEXT NOT NULL, normalized_url TEXT, platform TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_class TEXT, error_message TEXT,
+        media_kind TEXT, title TEXT, filesize_bytes BIGINT,
+        duration_s FLOAT, width INTEGER, height INTEGER,
+        transcoded BOOLEAN NOT NULL DEFAULT 0,
+        telegram_file_id TEXT,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME, elapsed_s FLOAT
+    );
+    INSERT INTO requests (user_id, chat_id, message_id, chat_type, url, status)
+    VALUES (1, 555, 42, 'private', 'https://youtube.com/watch?v=abc', 'success');
+"""
+
+
 async def test_startup_purges_legacy_user_data(tmp_path: Path):
-    """A pre-anonymity DB (users table + identifying columns) is cleaned on init."""
+    """A pre-anonymity DB (users table + FK'd identifying columns) is cleaned on init.
+
+    This reproduces the real production failure: dropping `users` or `user_id` with the
+    foreign key in place raises under `PRAGMA foreign_keys=ON`.
+    """
     path = tmp_path / "legacy.db"
-    # Build an "old" schema by hand, with identifying data in it.
     with sqlite3.connect(path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY, telegram_id BIGINT, username TEXT
-            );
-            INSERT INTO users (telegram_id, username) VALUES (777, 'alice');
-            CREATE TABLE requests (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER, chat_id BIGINT, message_id BIGINT,
-                chat_type TEXT NOT NULL,
-                url TEXT NOT NULL, normalized_url TEXT, platform TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                error_class TEXT, error_message TEXT,
-                media_kind TEXT, title TEXT, filesize_bytes BIGINT,
-                duration_s FLOAT, width INTEGER, height INTEGER,
-                transcoded BOOLEAN NOT NULL DEFAULT 0,
-                telegram_file_id TEXT,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                completed_at DATETIME, elapsed_s FLOAT
-            );
-            INSERT INTO requests (user_id, chat_id, message_id, chat_type, url, status)
-            VALUES (1, 555, 42, 'private', 'https://youtube.com/watch?v=abc', 'success');
-            """
-        )
+        conn.executescript(_LEGACY_SCHEMA)
 
     await repo.init_db(path)
     try:
@@ -187,6 +195,13 @@ async def test_startup_purges_legacy_user_data(tmp_path: Path):
             columns = await conn.run_sync(
                 lambda c: {col["name"] for col in inspect(c).get_columns("requests")}
             )
+        # The DB is fully usable after migration: a fresh write must succeed.
+        await repo.create_request(
+            chat_type="private",
+            url="https://x.com/i/status/9",
+            normalized_url="https://x.com/i/status/9",
+            platform="twitter",
+        )
     finally:
         await repo.close_db()
 
@@ -196,8 +211,29 @@ async def test_startup_purges_legacy_user_data(tmp_path: Path):
     )
     # The pre-existing request row survives, minus its identifying fields.
     with sqlite3.connect(path) as conn:
-        row = conn.execute("SELECT chat_type, url, status FROM requests").fetchone()
+        row = conn.execute(
+            "SELECT chat_type, url, status FROM requests WHERE id = 1"
+        ).fetchone()
     assert row == ("private", "https://youtube.com/watch?v=abc", "success")
+
+
+async def test_legacy_purge_is_idempotent(tmp_path: Path):
+    """Running init twice over a legacy DB must not fail the second time."""
+    path = tmp_path / "legacy2.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_LEGACY_SCHEMA)
+
+    await repo.init_db(path)
+    await repo.close_db()
+    # Second init over the now-clean DB: no-op, must not raise.
+    await repo.init_db(path)
+    try:
+        async with repo._session() as session:
+            conn = await session.connection()
+            tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+    finally:
+        await repo.close_db()
+    assert "users" not in tables
 
 
 # ------------------------------------------------------------------------ requests

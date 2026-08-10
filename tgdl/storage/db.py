@@ -6,6 +6,7 @@ new connection, and schema creation. `repo.py` holds the module-level engine sta
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -59,10 +60,13 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker:
 
 
 async def create_all(engine: AsyncEngine) -> None:
-    """Create any missing tables/indexes, then purge legacy identifying data. Idempotent."""
+    """Purge any legacy identifying data, then create missing tables/indexes. Idempotent."""
+    # Migration first, on its own autocommit connection (see _purge_* for why), then
+    # the normal schema creation in a transaction.
+    async with engine.connect() as conn:
+        await conn.run_sync(_purge_legacy_identifying_data)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_purge_legacy_identifying_data)
 
 
 # Columns that older versions stored on `requests` before the bot went anonymous.
@@ -72,36 +76,59 @@ _LEGACY_IDENTIFYING_COLUMNS = ("user_id", "chat_id", "message_id")
 def _purge_legacy_identifying_data(sync_conn: Any) -> None:
     """Retire identifying data left by pre-anonymity databases.
 
-    - Drop the old `users` table entirely.
     - Drop `user_id` / `chat_id` / `message_id` from `requests` (SQLite >= 3.35 supports
       DROP COLUMN; on older engines we fall back to nulling the values so nothing
-      identifying survives even if the column can't be removed).
+      identifying survives even if the column can't be removed). `user_id` carries a
+      foreign key to `users`, so it must go before that table can be dropped.
+    - Drop the old `users` table entirely.
+
+    Runs the DDL with SQLite foreign-key enforcement OFF and in AUTOCOMMIT: the legacy
+    `requests.user_id` FK references `users`, so with FKs on the drops would raise, and
+    `PRAGMA foreign_keys` is ignored inside a transaction. Executing on a raw DBAPI
+    connection (below SQLAlchemy's transaction layer) keeps this migration from
+    colliding with the ORM's transaction management.
 
     Runs on every startup and is a no-op once the schema is clean.
     """
-    from sqlalchemy import inspect, text
-    from sqlalchemy.exc import OperationalError
+    from sqlalchemy import inspect
 
-    inspector = inspect(sync_conn)
-    tables = set(inspector.get_table_names())
+    def has_users() -> bool:
+        return "users" in set(inspect(sync_conn).get_table_names())
 
-    if "users" in tables:
-        logger.warning("dropping legacy `users` table (bot is now anonymous)")
-        sync_conn.execute(text("DROP TABLE users"))
+    def legacy_columns() -> list[str]:
+        if "requests" not in set(inspect(sync_conn).get_table_names()):
+            return []
+        existing = {col["name"] for col in inspect(sync_conn).get_columns("requests")}
+        return [c for c in _LEGACY_IDENTIFYING_COLUMNS if c in existing]
 
-    if "requests" not in tables:
+    # Fast path: nothing legacy to do (the common case on a clean DB).
+    if not has_users() and not legacy_columns():
         return
 
-    existing = {col["name"] for col in inspector.get_columns("requests")}
-    to_remove = [c for c in _LEGACY_IDENTIFYING_COLUMNS if c in existing]
-    for column in to_remove:
-        try:
-            sync_conn.execute(text(f"ALTER TABLE requests DROP COLUMN {column}"))
-            logger.warning("dropped legacy identifying column requests.%s", column)
-        except OperationalError:
-            # Old SQLite without DROP COLUMN: at least erase the values.
-            sync_conn.execute(text(f"UPDATE requests SET {column} = NULL"))
-            logger.warning(
-                "could not drop requests.%s (old SQLite); nulled its values instead",
-                column,
-            )
+    # Drop below SQLAlchemy to the raw sqlite3 connection so we control the
+    # transaction directly: end any open tx, disable FKs, run DDL in autocommit.
+    raw = sync_conn.connection.dbapi_connection
+    raw.rollback()
+    prev_isolation = raw.isolation_level
+    raw.isolation_level = None  # autocommit — required for DDL + PRAGMA to take effect
+    cur = raw.cursor()
+    try:
+        cur.execute("PRAGMA foreign_keys=OFF")
+        for column in legacy_columns():
+            try:
+                cur.execute(f"ALTER TABLE requests DROP COLUMN {column}")
+                logger.warning("dropped legacy identifying column requests.%s", column)
+            except sqlite3.OperationalError:
+                # Old SQLite without DROP COLUMN: at least erase the values.
+                cur.execute(f"UPDATE requests SET {column} = NULL")
+                logger.warning(
+                    "could not drop requests.%s (old SQLite); nulled its values instead",
+                    column,
+                )
+        if has_users():
+            logger.warning("dropping legacy `users` table (bot is now anonymous)")
+            cur.execute("DROP TABLE users")
+        cur.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cur.close()
+        raw.isolation_level = prev_isolation
