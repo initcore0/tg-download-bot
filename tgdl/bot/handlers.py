@@ -251,11 +251,31 @@ async def _send_results(
 # ------------------------------------------------------------------------- main flow
 
 
+def _user_key(message: Message) -> int:
+    """Per-user rate-limit key: the sender id, or the chat id for channel posts."""
+    if message.from_user is not None:
+        return message.from_user.id
+    return message.chat.id
+
+
 async def process_url(message: Message, url: str, settings: Settings) -> None:
     """Full download+send+audit cycle for one URL. Never raises."""
     quote = _is_group(message) or message.chat.type == ChatType.CHANNEL
     started = time.monotonic()
 
+    # Per-user abuse guard: refuse a new download while this user already has one
+    # in flight, so a single user cannot monopolize the global download slots.
+    with runtime.user_slot(_user_key(message)) as granted:
+        if not granted:
+            await _reply(message, responses.BUSY_PER_USER, quote=quote)
+            return
+        await _run_download(message, url, settings, quote=quote, started=started)
+
+
+async def _run_download(
+    message: Message, url: str, settings: Settings, *, quote: bool, started: float
+) -> None:
+    """The download+send+audit cycle, run while holding a user slot. Never raises."""
     user_id = await _audit_user(message)
     request_id = await _audit_create_request(message, user_id, url)
 

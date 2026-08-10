@@ -5,6 +5,7 @@ from tgdl.downloader.models import (
     MediaResult,
     MediaTooLargeError,
     TranscodeError,
+    TransientExtractionError,
     UnsupportedUrlError,
 )
 from tgdl.downloader.service import download_media
@@ -16,6 +17,7 @@ __all__ = [
     "MediaResult",
     "MediaTooLargeError",
     "TranscodeError",
+    "TransientExtractionError",
     "UnsupportedUrlError",
     "download_media",
 ]

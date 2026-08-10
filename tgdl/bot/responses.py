@@ -27,6 +27,8 @@ DEFAULT_USERNAME = "the_bot"
 
 GENERIC_ERROR = "❌ Something went wrong."
 
+BUSY_PER_USER = "⏳ I'm still working on your previous link — please wait for it to finish."
+
 
 def start_text(username: str | None) -> str:
     return START.format(username=username or DEFAULT_USERNAME)

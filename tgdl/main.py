@@ -16,6 +16,7 @@ from sqlalchemy.exc import OperationalError
 
 from tgdl.bot import handlers, runtime
 from tgdl.config import Settings, load_settings
+from tgdl.downloader import transcode, ytdlp
 from tgdl.storage import repo
 
 log = logging.getLogger("tgdl")
@@ -43,6 +44,14 @@ async def _resolve_username(bot: Bot) -> str | None:
 
 async def run(settings: Settings) -> None:
     """Async entrypoint: init DB, start long polling, shut down cleanly."""
+    if not transcode.ffmpeg_available():
+        raise SystemExit(
+            "ERROR: ffmpeg and/or ffprobe were not found on PATH. They are required "
+            "for remuxing and transcoding. Install ffmpeg (the Docker image already "
+            "includes it) and try again."
+        )
+    ytdlp.configure(cookies_file=settings.youtube_cookies_file)
+
     try:
         await repo.init_db(settings.database_path)
     except (OperationalError, OSError) as exc:
@@ -69,7 +78,10 @@ async def run(settings: Settings) -> None:
     # Injected into every handler as the `settings` kwarg.
     dp["settings"] = settings
 
-    runtime.configure(settings.max_concurrent_downloads)
+    runtime.configure(
+        settings.max_concurrent_downloads,
+        max_per_user=settings.max_per_user_concurrent,
+    )
 
     try:
         await _resolve_username(bot)
@@ -86,8 +98,26 @@ async def run(settings: Settings) -> None:
             log.exception("error closing bot session")
 
 
+async def _healthcheck(settings: Settings) -> int:
+    """Liveness probe: confirm the token/network are working via getMe. 0 = healthy."""
+    bot = Bot(token=settings.telegram_bot_token)
+    try:
+        await bot.get_me()
+        return 0
+    except Exception as exc:  # noqa: BLE001 - any failure means unhealthy
+        print(f"healthcheck failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await bot.session.close()
+
+
 def main() -> None:
     settings = load_settings()
+
+    if "--healthcheck" in sys.argv:
+        if not settings.telegram_bot_token.strip():
+            sys.exit(1)
+        sys.exit(asyncio.run(_healthcheck(settings)))
 
     if not settings.telegram_bot_token.strip():
         print(

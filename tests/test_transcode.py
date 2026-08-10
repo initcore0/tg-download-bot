@@ -140,6 +140,31 @@ class TestRemux:
         head = dst.read_bytes()
         assert head.index(b"moov") < head.index(b"mdat")
 
+    async def test_has_faststart_detects_front_moov(self, h264_mkv, tmp_path):
+        # A freshly remuxed file is guaranteed faststart.
+        dst = tmp_path / "fs.mp4"
+        await tc.remux(h264_mkv, dst)
+        assert tc.has_faststart(dst) is True
+
+    async def test_has_faststart_false_when_moov_at_back(self, h264_mkv, tmp_path):
+        # Encode WITHOUT +faststart: ffmpeg writes mdat before moov by default.
+        dst = tmp_path / "back.mp4"
+        args = [
+            tc.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(h264_mkv), "-c", "copy", str(dst),
+        ]
+        code, _, _ = await tc._run(args, what="test encode")
+        assert code == 0
+        raw = dst.read_bytes()
+        if raw.index(b"moov") < raw.index(b"mdat"):
+            pytest.skip("this ffmpeg placed moov first without +faststart")
+        assert tc.has_faststart(dst) is False
+
+    def test_has_faststart_false_on_garbage(self, tmp_path):
+        bad = tmp_path / "bad.mp4"
+        bad.write_bytes(b"not an mp4 at all, no boxes here")
+        assert tc.has_faststart(bad) is False
+
     async def test_remux_failure_raises(self, tmp_path):
         bad = tmp_path / "bad.mkv"
         bad.write_bytes(b"garbage")
@@ -283,9 +308,10 @@ class TestGifAndAnimation:
         info = await tc.probe(gif_file)
         assert tc.is_animation(info, ".gif")
 
-    async def test_silent_short_video_is_animation(self, silent_mp4):
+    async def test_silent_short_video_is_not_animation(self, silent_mp4):
+        # A muted video is still a video, not a looping GIF — sent via sendVideo.
         info = await tc.probe(silent_mp4)
-        assert tc.is_animation(info, ".mp4")
+        assert not tc.is_animation(info, ".mp4")
 
     async def test_video_with_audio_is_not_animation(self, h264_mp4):
         info = await tc.probe(h264_mp4)

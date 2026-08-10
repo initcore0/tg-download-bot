@@ -16,8 +16,15 @@ from tgdl.downloader.models import TranscodeError
 
 log = logging.getLogger(__name__)
 
-FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+#: Resolved from PATH. When absent these stay as the bare command names so error
+#: messages are still readable; `ffmpeg_available()` is the startup preflight.
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "ffprobe"
+
+
+def ffmpeg_available() -> bool:
+    """True when both ffmpeg and ffprobe are resolvable on PATH."""
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 # Containers Telegram plays back reliably without a rewrite.
 _OK_CONTAINERS = {"mp4", "mov", "m4a", "3gp", "mj2"}
@@ -200,6 +207,40 @@ def _output_path(src: Path, suffix: str, ext: str = ".mp4") -> Path:
     return candidate
 
 
+def has_faststart(path: Path, *, scan_bytes: int = 64 * 1024) -> bool:
+    """True if an MP4's `moov` atom precedes `mdat` (streamable/previewable).
+
+    Telegram can only show an in-chat preview before the full file downloads when moov
+    is at the front. We read just the top-level box headers, not the whole file. On any
+    parse difficulty we return False so the caller remuxes — the safe, cheap default.
+    """
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(scan_bytes)
+    except OSError:
+        return False
+
+    offset = 0
+    n = len(header)
+    while offset + 8 <= n:
+        size = int.from_bytes(header[offset : offset + 4], "big")
+        box_type = header[offset + 4 : offset + 8]
+        if box_type == b"moov":
+            return True
+        if box_type == b"mdat":
+            return False
+        if size == 1:
+            # 64-bit largesize box — skip using the extended size if we have it.
+            if offset + 16 > n:
+                return False
+            size = int.from_bytes(header[offset + 8 : offset + 16], "big")
+        if size < 8:
+            return False  # malformed / unknown; let the caller remux to be safe
+        offset += size
+    # moov not seen within the scanned prefix -> assume it's at the back.
+    return False
+
+
 async def remux(src: Path, dst: Path | None = None) -> Path:
     """Stream-copy `src` into a faststart MP4. Cheapest fix for a wrong container."""
     dst = dst or _output_path(src, "_remux")
@@ -221,11 +262,6 @@ async def remux(src: Path, dst: Path | None = None) -> Path:
     if code != 0 or not dst.exists() or dst.stat().st_size == 0:
         raise TranscodeError(f"remux failed for {src.name}: {stderr.decode(errors='replace')[:500]}")
     return dst
-
-
-async def faststart(src: Path, dst: Path | None = None) -> Path:
-    """Rewrite an MP4 with the moov atom up front, without re-encoding."""
-    return await remux(src, dst)
 
 
 async def transcode(
@@ -351,12 +387,13 @@ async def gif_to_mp4(src: Path, dst: Path | None = None, *, max_height: int = 72
 
 
 def is_animation(info: MediaInfo, source_ext: str | None = None) -> bool:
-    """A silent, short clip — or anything that came from a .gif — is an animation."""
+    """Only true GIF sources are animations.
+
+    Telegram renders animations as looping, audio-less GIF players. A silent regular
+    video (screen recording, muted clip, timelapse) is still a *video* and must be sent
+    as one — otherwise it loops with no player controls. So we key strictly on the GIF
+    origin, not on "silent and short", which was misclassifying ordinary muted videos.
+    """
     if info.is_image or not info.has_video:
         return False
-    if (source_ext or "").lower() == ".gif" or info.container == "gif":
-        return True
-    if info.has_audio:
-        return False
-    duration = info.duration_s
-    return duration is not None and duration <= ANIMATION_MAX_DURATION_S
+    return (source_ext or "").lower() == ".gif" or info.container == "gif"

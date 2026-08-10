@@ -152,3 +152,69 @@ class TestNormalizeUrl:
 
     def test_preserves_path_case_and_query_values(self):
         assert normalize_url("https://example.com/AbC?q=Hello") == "https://example.com/AbC?q=Hello"
+
+
+import socket
+
+from tgdl.downloader.urls import is_safe_public_url
+
+
+def _resolver_returning(ip: str):
+    """Fake socket.getaddrinfo that always resolves to `ip`."""
+    def _resolve(host, port, *args, **kwargs):
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, port))]
+    return _resolve
+
+
+class TestSsrfGuard:
+    def test_public_host_allowed(self):
+        assert is_safe_public_url(
+            "https://youtube.com/watch?v=x", resolver=_resolver_returning("142.250.72.14")
+        )
+
+    def test_literal_public_ip_allowed(self):
+        assert is_safe_public_url("https://8.8.8.8/x", resolver=_resolver_returning("8.8.8.8"))
+
+    def test_cloud_metadata_blocked(self):
+        # The classic SSRF target.
+        assert not is_safe_public_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_localhost_blocked(self):
+        assert not is_safe_public_url("http://localhost/x", resolver=_resolver_returning("127.0.0.1"))
+
+    def test_private_range_blocked(self):
+        assert not is_safe_public_url(
+            "http://internal.local/x", resolver=_resolver_returning("10.1.2.3")
+        )
+        assert not is_safe_public_url(
+            "http://nas.home/x", resolver=_resolver_returning("192.168.1.10")
+        )
+
+    def test_literal_private_ip_blocked(self):
+        assert not is_safe_public_url("http://192.168.0.1/x")
+        assert not is_safe_public_url("http://127.0.0.1:8080/x")
+        assert not is_safe_public_url("http://[::1]/x")
+
+    def test_ipv4_mapped_ipv6_metadata_blocked(self):
+        assert not is_safe_public_url(
+            "http://sneaky/x", resolver=_resolver_returning("::ffff:169.254.169.254")
+        )
+
+    def test_non_http_scheme_blocked(self):
+        assert not is_safe_public_url("file:///etc/passwd")
+        assert not is_safe_public_url("ftp://example.com/x")
+
+    def test_dns_failure_fails_closed(self):
+        def _boom(*args, **kwargs):
+            raise socket.gaierror("nope")
+        assert not is_safe_public_url("https://does-not-exist.invalid/x", resolver=_boom)
+
+    def test_dns_rebinding_any_bad_answer_rejects(self):
+        # A resolver returning both a public and a private address must be rejected.
+        def _mixed(host, port, *args, **kwargs):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.2.3.4", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)),
+            ]
+        assert not is_safe_public_url("https://evil.example/x", resolver=_mixed)

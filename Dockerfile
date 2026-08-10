@@ -36,5 +36,9 @@ RUN useradd --create-home --uid 10001 tgdl \
 
 VOLUME ["/app/data"]
 
+# Liveness: getMe against Telegram confirms token + network are working.
+HEALTHCHECK --interval=60s --timeout=15s --start-period=20s --retries=3 \
+    CMD ["/app/.venv/bin/python", "-m", "tgdl.main", "--healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["uv", "run", "--no-sync", "tgdl-bot"]

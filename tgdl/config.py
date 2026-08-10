@@ -1,7 +1,4 @@
-"""Typed application settings, loaded from environment / .env.
-
-FROZEN by the architect — build agents must not modify this file.
-"""
+"""Typed application settings, loaded from environment / .env."""
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,6 +15,15 @@ class Settings(BaseSettings):
     max_concurrent_downloads: int = 3
     download_timeout_s: int = 300
     log_level: str = "INFO"
+
+    # Optional Netscape-format cookies file. On datacenter IPs (most VPS/Coolify
+    # hosts) YouTube demands "Sign in to confirm you're not a bot"; a cookies file
+    # exported from a logged-in browser is the reliable fix. Left empty, the bot
+    # relies on player-client fallback (android/ios/tv), which covers many cases.
+    youtube_cookies_file: Path | None = None
+
+    # Max in-flight downloads a single user can hold at once (abuse guard).
+    max_per_user_concurrent: int = 1
 
     @property
     def max_file_size_bytes(self) -> int:

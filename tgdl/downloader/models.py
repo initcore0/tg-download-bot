@@ -48,6 +48,19 @@ class ExtractionError(DownloadError):
     user_message = "I couldn't fetch media from that link. It may be private, deleted, or unsupported."
 
 
+class TransientExtractionError(ExtractionError):
+    """A retryable extraction failure (throttling, bot-check, transient network/5xx).
+
+    Subclasses ExtractionError so existing `except ExtractionError` handling still
+    catches it; the service layer retries it before giving up.
+    """
+
+    user_message = (
+        "That service is rate-limiting or temporarily unavailable. "
+        "Please try again in a moment."
+    )
+
+
 class MediaTooLargeError(DownloadError):
     user_message = "That video is too large to send over Telegram (50 MB bot limit), even after compression."
 

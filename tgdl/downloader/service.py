@@ -21,7 +21,7 @@ from tgdl.downloader.models import (
     MediaTooLargeError,
     UnsupportedUrlError,
 )
-from tgdl.downloader.urls import detect_platform
+from tgdl.downloader.urls import detect_platform, is_safe_public_url
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,11 @@ async def download_media(
     started = time.monotonic()
     if not url or not url.strip():
         raise UnsupportedUrlError("empty url")
+
+    # SSRF guard: never let the extractor fetch internal/link-local hosts. DNS
+    # resolution is blocking, so run it off the event loop.
+    if not await asyncio.to_thread(is_safe_public_url, url.strip()):
+        raise UnsupportedUrlError(f"blocked non-public or unresolvable host: {url}")
 
     workdir = Path(workdir)
     try:
@@ -224,6 +229,12 @@ async def _ensure_compatible(
         # Codecs and container are fine, but the frame is larger than we want to ship.
         return await tc.transcode(path, max_height=max_height), True
     if decision == tc.Decision.REMUX:
+        return await tc.remux(path), False
+    # Passthrough: codecs and container are already fine. Still ensure the moov atom is
+    # at the front so Telegram can preview/stream before the full download completes.
+    # This is a stream-copy rewrite (~1s), so it does not count as a transcode.
+    if not tc.has_faststart(path):
+        log.debug("%s lacks faststart; remuxing moov to front", path.name)
         return await tc.remux(path), False
     return path, False
 

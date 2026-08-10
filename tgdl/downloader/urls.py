@@ -4,7 +4,9 @@ Implemented by Agent A (M1). Public signatures are FROZEN.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # http(s) URLs. We deliberately keep the character class permissive, then trim
@@ -200,3 +202,59 @@ def normalize_url(url: str) -> str:
         # urlunsplit keeps a lone "/" path; drop it for a stable key.
         normalized = normalized.rstrip("/")
     return normalized
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for addresses an outbound fetch should never reach (SSRF guard)."""
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+        # IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) must be unwrapped and rechecked.
+        or (getattr(ip, "ipv4_mapped", None) is not None and _is_blocked_ip(ip.ipv4_mapped))
+    )
+
+
+def is_safe_public_url(url: str, *, resolver=socket.getaddrinfo) -> bool:
+    """Reject URLs that resolve to private/link-local/loopback/reserved addresses.
+
+    Prevents the yt-dlp generic extractor from being turned into a request forwarder
+    against internal services (cloud metadata at 169.254.169.254, LAN hosts, localhost).
+    Only http/https with a resolvable, public host passes. DNS failures fail closed.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in ("http", "https"):
+        return False
+    host = parts.hostname
+    if not host:
+        return False
+
+    # A literal IP in the URL: check it directly.
+    try:
+        return not _is_blocked_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # hostname, not an IP — resolve it below.
+
+    try:
+        infos = resolver(host, parts.port or (443 if parts.scheme == "https" else 80),
+                         proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False  # unresolvable -> fail closed
+    if not infos:
+        return False
+
+    for info in infos:
+        sockaddr = info[4]
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        if _is_blocked_ip(ip):
+            return False  # any resolved address in a blocked range -> reject
+    return True

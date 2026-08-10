@@ -10,18 +10,93 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from tgdl.downloader.models import ExtractionError, UnsupportedUrlError
+from tgdl.downloader.models import (
+    ExtractionError,
+    TransientExtractionError,
+    UnsupportedUrlError,
+)
 
 log = logging.getLogger(__name__)
 
 # Errors that mean "this link will never work", as opposed to transient failures.
 _UNSUPPORTED_MARKERS = (
     "unsupported url",
-    "no video formats found",
     "is not a valid url",
-    "unable to extract",
     "no media found",
 )
+
+# Errors that are private/removed content — permanent, but not "unsupported".
+_PERMANENT_MARKERS = (
+    "private video",
+    "video unavailable",
+    "this video is unavailable",
+    "video has been removed",
+    "account has been terminated",
+    "video is not available",
+    "removed by the user",
+    "this post is unavailable",
+    "no longer available",
+    "requested content is not available",
+    "age-restricted",
+    "sign in to confirm your age",
+    "members-only",
+    "this live event",
+)
+
+# Errors that are worth retrying: throttling, bot-checks, network, transient 5xx.
+# YouTube in particular returns these intermittently and clears on retry or a
+# different player client.
+_TRANSIENT_MARKERS = (
+    "http error 403",
+    "http error 429",
+    "http error 5",  # 500/502/503/504
+    "sign in to confirm you're not a bot",
+    "confirm you're not a bot",
+    "unable to download webpage",
+    "unable to download api page",
+    "read timed out",
+    "connection reset",
+    "connection timed out",
+    "temporary failure",
+    "the read operation timed out",
+    "unable to download video data",
+    "giving up after",
+    "fragment",
+    "unable to extract",  # often transient signature-extraction failures on YouTube
+    "requested format is not available",
+    "precondition check failed",
+    "failed to extract any player response",
+    "please try again",
+)
+
+# YouTube player clients tried in order when extraction keeps failing. Different
+# clients dodge different bot-checks/throttles without needing cookies.
+_YT_CLIENT_FALLBACKS: tuple[tuple[str, ...], ...] = (
+    (),  # yt-dlp default
+    ("android", "web"),
+    ("ios",),
+    ("tv",),
+)
+
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE_S = 1.5
+
+# Optional cookies file (Netscape format), set once at startup. On datacenter IPs
+# this is the reliable way past YouTube's "confirm you're not a bot" gate.
+_COOKIES_FILE: Path | None = None
+
+
+def configure(*, cookies_file: Path | None = None) -> None:
+    """Set process-wide extraction options (called once from main)."""
+    global _COOKIES_FILE
+    if cookies_file is not None and Path(cookies_file).is_file():
+        _COOKIES_FILE = Path(cookies_file)
+        log.info("using YouTube cookies file: %s", _COOKIES_FILE)
+    elif cookies_file is not None:
+        log.warning("cookies file %s not found — continuing without cookies", cookies_file)
+        _COOKIES_FILE = None
+    else:
+        _COOKIES_FILE = None
 
 
 def build_format_selector(max_height: int) -> str:
@@ -39,8 +114,13 @@ def build_options(
     *,
     max_height: int,
     playlist_items: str | None = None,
+    youtube_clients: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """yt-dlp options: quiet, contained inside `workdir`, no writes elsewhere."""
+    """yt-dlp options: quiet, contained inside `workdir`, no writes elsewhere.
+
+    `youtube_clients`, when non-empty, forces yt-dlp's YouTube player-client order —
+    used by the retry loop to dodge client-specific throttling/bot-checks.
+    """
     opts: dict[str, Any] = {
         "format": build_format_selector(max_height),
         "format_sort": [f"res:{max_height}", "codec:h264", "br"],
@@ -67,18 +147,31 @@ def build_options(
     }
     if playlist_items is not None:
         opts["playlist_items"] = playlist_items
-        opts.pop("noplaylist", None)
         opts["noplaylist"] = False
+    if youtube_clients:
+        opts["extractor_args"] = {"youtube": {"player_client": list(youtube_clients)}}
+    if _COOKIES_FILE is not None:
+        opts["cookiefile"] = str(_COOKIES_FILE)
     return opts
 
 
 def _classify(exc: Exception) -> Exception:
-    """Map a yt-dlp exception onto our error taxonomy."""
+    """Map a yt-dlp exception onto our error taxonomy.
+
+    Order matters: transient (retryable) and permanent (private/removed) are checked
+    before the generic buckets so a throttle isn't mislabeled "unsupported".
+    """
     message = str(exc)
     lowered = message.lower()
+    if any(marker in lowered for marker in _TRANSIENT_MARKERS):
+        return TransientExtractionError(message)
+    if any(marker in lowered for marker in _PERMANENT_MARKERS):
+        return ExtractionError(message)
     if any(marker in lowered for marker in _UNSUPPORTED_MARKERS):
         return UnsupportedUrlError(message)
-    return ExtractionError(message)
+    # Unknown failures are treated as transient once — cheap insurance against
+    # yt-dlp phrasings we haven't catalogued; the retry loop caps total attempts.
+    return TransientExtractionError(message)
 
 
 def _entries(info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -130,34 +223,49 @@ async def extract(
     max_height: int,
     playlist_items: str | None = None,
     download: bool = True,
+    max_attempts: int = _MAX_ATTEMPTS,
 ) -> list[dict[str, Any]]:
     """Download `url` into `workdir`; return one info dict per downloaded item.
 
-    Raises UnsupportedUrlError / ExtractionError — never a bare exception.
+    Retries transient failures (throttling, bot-checks, transient network/5xx) with
+    exponential backoff, cycling YouTube player clients between attempts. Permanent
+    failures (UnsupportedUrlError / non-transient ExtractionError) raise immediately.
+    Never raises a bare exception.
     """
-    opts = build_options(workdir, max_height=max_height, playlist_items=playlist_items)
-    info = await asyncio.to_thread(_extract_sync, url, opts, download=download)
-    entries = _entries(info)
-    if not entries:
-        raise ExtractionError(f"no downloadable entries at {url}")
-    return entries
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        clients = _YT_CLIENT_FALLBACKS[min(attempt, len(_YT_CLIENT_FALLBACKS) - 1)]
+        opts = build_options(
+            workdir,
+            max_height=max_height,
+            playlist_items=playlist_items,
+            youtube_clients=clients,
+        )
+        try:
+            info = await asyncio.to_thread(_extract_sync, url, opts, download=download)
+            entries = _entries(info)
+            if not entries:
+                raise ExtractionError(f"no downloadable entries at {url}")
+            if attempt:
+                log.info("extraction of %s succeeded on attempt %d", url, attempt + 1)
+            return entries
+        except TransientExtractionError as exc:
+            last_exc = exc
+            if attempt + 1 >= max_attempts:
+                break
+            delay = _BACKOFF_BASE_S * (2**attempt)
+            log.warning(
+                "transient extraction failure for %s (attempt %d/%d): %s — retrying in %.1fs",
+                url,
+                attempt + 1,
+                max_attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+        except (UnsupportedUrlError, ExtractionError):
+            raise  # permanent — do not retry
 
-
-async def probe_info(url: str, workdir: Path, *, max_height: int) -> dict[str, Any]:
-    """Metadata-only extraction (no download), used to detect image galleries."""
-    opts = build_options(workdir, max_height=max_height)
-    opts["skip_download"] = True
-    opts["extract_flat"] = False
-    return await asyncio.to_thread(_extract_sync, url, opts, download=False)
-
-
-def looks_like_image_entry(entry: dict[str, Any]) -> bool:
-    """True when yt-dlp describes this entry as a still image rather than a video."""
-    if entry.get("_type") == "image":
-        return True
-    ext = (entry.get("ext") or "").lower()
-    if ext in {"jpg", "jpeg", "png", "webp", "heic"}:
-        return True
-    vcodec = (entry.get("vcodec") or "").lower()
-    acodec = (entry.get("acodec") or "").lower()
-    return vcodec == "none" and acodec == "none"
+    # Exhausted retries: surface the last transient error (retryable message).
+    assert last_exc is not None
+    raise last_exc

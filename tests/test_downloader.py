@@ -119,10 +119,13 @@ class TestHappyPaths:
 
 
 class TestKinds:
-    async def test_silent_short_video_is_animation(self, stub_extract, silent_mp4, tmp_path):
+    async def test_silent_short_video_is_video_not_animation(
+        self, stub_extract, silent_mp4, tmp_path
+    ):
+        # Regression: muted videos were being sent as looping GIF-style animations.
         stub_extract([silent_mp4])
         (result,) = await service.download_media("https://example.com/v", tmp_path, max_size_bytes=CAP)
-        assert result.kind == "animation"
+        assert result.kind == "video"
 
     async def test_gif_becomes_animation_mp4(self, stub_extract, gif_file, tmp_path):
         stub_extract([gif_file])

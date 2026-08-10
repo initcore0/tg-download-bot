@@ -48,6 +48,7 @@ def make_message(
     chat_id: int = 111,
     message_id: int = 42,
     from_user: bool = True,
+    user_id: int = 777,
     caption: str | None = None,
 ) -> MagicMock:
     """A Message test double with AsyncMock send methods."""
@@ -59,7 +60,7 @@ def make_message(
 
     if from_user:
         msg.from_user = SimpleNamespace(
-            id=777, username="alice", first_name="Alice", last_name="A"
+            id=user_id, username="alice", first_name="Alice", last_name="A"
         )
     else:
         msg.from_user = None
@@ -645,7 +646,9 @@ class TestConcurrency:
         self, settings, tmp_path, mock_repo, mock_download
     ):
         runtime.reset()
-        runtime.configure(2, BOT_USERNAME)
+        # High per-user cap so the GLOBAL semaphore (2) is the binding constraint;
+        # distinct users so the per-user guard doesn't gate them first.
+        runtime.configure(2, BOT_USERNAME, max_per_user=10)
 
         active = 0
         peak = 0
@@ -663,9 +666,11 @@ class TestConcurrency:
 
         tasks = [
             asyncio.create_task(
-                handlers.handle_private(make_message("https://youtu.be/abc"), settings)
+                handlers.handle_private(
+                    make_message("https://youtu.be/abc", user_id=1000 + i), settings
+                )
             )
-            for _ in range(5)
+            for i in range(5)
         ]
         await asyncio.sleep(0.05)
         observed_peak = peak
@@ -673,6 +678,49 @@ class TestConcurrency:
         await asyncio.gather(*tasks)
 
         assert observed_peak == 2, f"expected max 2 concurrent downloads, saw {observed_peak}"
+
+    async def test_per_user_limit_rejects_second_concurrent(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        runtime.reset()
+        runtime.configure(5, BOT_USERNAME, max_per_user=1)
+
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _download(url, workdir, **kwargs):
+            started.set()
+            await release.wait()
+            return [make_media(Path(workdir))]
+
+        mock_download.side_effect = _download
+
+        # Same user fires twice; the first holds the only slot.
+        first = asyncio.create_task(
+            handlers.handle_private(make_message("https://youtu.be/abc", user_id=42), settings)
+        )
+        await started.wait()
+        second_msg = make_message("https://youtu.be/def", user_id=42)
+        await handlers.handle_private(second_msg, settings)
+
+        # The second was rejected immediately with the busy message; no download ran.
+        second_msg.answer.assert_awaited_once_with(responses.BUSY_PER_USER)
+        assert mock_download.await_count == 1
+
+        release.set()
+        await first
+
+    async def test_per_user_limit_allows_different_users(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        runtime.reset()
+        runtime.configure(5, BOT_USERNAME, max_per_user=1)
+        mock_download.return_value = [make_media(tmp_path)]
+
+        await handlers.handle_private(make_message("https://youtu.be/a", user_id=1), settings)
+        await handlers.handle_private(make_message("https://youtu.be/b", user_id=2), settings)
+
+        assert mock_download.await_count == 2
 
 
 class TestFileIdExtraction:
