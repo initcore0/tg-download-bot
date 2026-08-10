@@ -51,13 +51,15 @@ Telegram update
        1. Extract URL(s) from message text/entities (first supported URL wins).
           Private chat: any URL. Group/channel: only when @botusername is mentioned.
        2. Audit: get_or_create_user + create_request  (storage/repo.py)
-       3. React immediately: chat action "upload_video" + status message ("⏳ Working…").
+       3. React immediately with the native chat-action status ("sending a video…"),
+          kept alive via ChatActionSender for the whole download (actions expire ~5s);
+          switched to "sending a photo…" during the upload phase when results are images.
        4. Acquire global semaphore (MAX_CONCURRENT_DOWNLOADS, default 3).
        5. downloader.service.download_media(url, workdir) → list[MediaResult]
        6. Send media (sendVideo / sendPhoto / sendAnimation / sendMediaGroup),
           reply-to the triggering message in groups. No caption.
        7. Audit: mark_success(request, results, telegram_file_id) or mark_failure(request, error).
-       8. Delete status message; delete workdir (always, in finally).
+       8. Delete workdir (always, in finally).
 ```
 
 ## 5. Downloader pipeline (`tgdl/downloader/`)

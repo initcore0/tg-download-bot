@@ -25,8 +25,6 @@ HELP = (
 # Fallback when the bot username isn't known yet (bot.me() not resolved).
 DEFAULT_USERNAME = "the_bot"
 
-STATUS_WORKING = "⏳ Working on it…"
-
 GENERIC_ERROR = "❌ Something went wrong."
 
 

@@ -1,7 +1,7 @@
 """aiogram handlers: commands, private URL messages, group/channel mentions.
 
 Request flow implemented here mirrors ARCHITECTURE.md §4:
-  extract URL -> audit -> status UX -> semaphore -> download -> send -> audit -> cleanup.
+  extract URL -> audit -> chat-action status -> semaphore -> download -> send -> audit -> cleanup.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, InputMediaPhoto, Message
+from aiogram.utils.chat_action import ChatActionSender
 
 from tgdl.bot import responses, runtime
 from tgdl.config import Settings
@@ -258,12 +259,12 @@ async def process_url(message: Message, url: str, settings: Settings) -> None:
     user_id = await _audit_user(message)
     request_id = await _audit_create_request(message, user_id, url)
 
+    # Immediate feedback ("sending a video…") even while queued on the semaphore;
+    # ChatActionSender then keeps the status alive (actions expire after ~5s).
     try:
         await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
     except Exception:
         log.debug("send_chat_action failed", exc_info=True)
-
-    status = await _reply(message, responses.STATUS_WORKING, quote=quote)
 
     workdir: Path | None = None
     try:
@@ -272,18 +273,28 @@ async def process_url(message: Message, url: str, settings: Settings) -> None:
             base.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(prefix="req-", dir=base))
 
-            results = await service.download_media(
-                url,
-                workdir,
-                max_size_bytes=settings.max_file_size_bytes,
-                max_height=settings.max_height,
-                timeout_s=settings.download_timeout_s,
-            )
+            async with ChatActionSender.upload_video(
+                bot=message.bot, chat_id=message.chat.id
+            ):
+                results = await service.download_media(
+                    url,
+                    workdir,
+                    max_size_bytes=settings.max_file_size_bytes,
+                    max_height=settings.max_height,
+                    timeout_s=settings.download_timeout_s,
+                )
 
             if not results:
                 raise DownloadError("downloader returned no results")
 
-            file_id = await _send_results(message, results, quote=quote)
+            # Upload phase: show the action matching what we're actually sending.
+            action_sender = (
+                ChatActionSender.upload_photo
+                if all(r.kind == "image" for r in results)
+                else ChatActionSender.upload_video
+            )
+            async with action_sender(bot=message.bot, chat_id=message.chat.id):
+                file_id = await _send_results(message, results, quote=quote)
 
         await _audit_success(request_id, results[0], file_id, time.monotonic() - started)
 
@@ -297,11 +308,6 @@ async def process_url(message: Message, url: str, settings: Settings) -> None:
         await _reply(message, responses.GENERIC_ERROR, quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
     finally:
-        if status is not None:
-            try:
-                await status.delete()
-            except Exception:
-                log.debug("failed to delete status message", exc_info=True)
         if workdir is not None:
             shutil.rmtree(workdir, ignore_errors=True)
 

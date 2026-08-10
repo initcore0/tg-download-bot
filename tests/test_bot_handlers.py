@@ -64,11 +64,8 @@ def make_message(
     else:
         msg.from_user = None
 
-    status = MagicMock(name="StatusMessage")
-    status.delete = AsyncMock()
-
-    msg.answer = AsyncMock(return_value=status)
-    msg.reply = AsyncMock(return_value=status)
+    msg.answer = AsyncMock(return_value=MagicMock(name="SentText"))
+    msg.reply = AsyncMock(return_value=MagicMock(name="SentText"))
     msg.answer_video = AsyncMock(return_value=sent_video("vid-file-id"))
     msg.reply_video = AsyncMock(return_value=sent_video("vid-file-id"))
     msg.answer_photo = AsyncMock(return_value=sent_photo("photo-file-id"))
@@ -81,7 +78,6 @@ def make_message(
     msg.bot = MagicMock()
     msg.bot.send_chat_action = AsyncMock()
 
-    msg._status = status
     return msg
 
 
@@ -291,7 +287,7 @@ class TestRouting:
         # Group results reply-to the trigger, never a plain send.
         msg.reply_video.assert_awaited_once()
         msg.answer_video.assert_not_awaited()
-        msg.reply.assert_awaited()  # status message was a reply too
+        msg.reply.assert_not_awaited()  # success sends media only, no text
 
     async def test_group_mention_without_url_ignored(
         self, settings, mock_repo, mock_download
@@ -429,16 +425,18 @@ class TestSuccessFlow:
         group = msg.answer_media_group.await_args.args[0]
         assert len(group) == handlers.MEDIA_GROUP_LIMIT == 10
 
-    async def test_status_message_shown_then_deleted(
+    async def test_no_status_text_on_success(
         self, settings, tmp_path, mock_repo, mock_download
     ):
+        """Status is conveyed via chat action only — success sends media, zero text."""
         mock_download.return_value = [make_media(tmp_path)]
         msg = make_message("https://youtu.be/abc")
 
         await handlers.handle_private(msg, settings)
 
-        msg.answer.assert_awaited_once_with(responses.STATUS_WORKING)
-        msg._status.delete.assert_awaited_once()
+        msg.answer.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+        msg.bot.send_chat_action.assert_awaited()
 
     async def test_upload_chat_action_sent(
         self, settings, tmp_path, mock_repo, mock_download
@@ -537,15 +535,16 @@ class TestFailureFlow:
         mock_repo.mark_failure.assert_awaited_once()
         mock_repo.mark_success.assert_not_awaited()
 
-    async def test_status_deleted_on_failure(
+    async def test_failure_sends_exactly_one_text(
         self, settings, mock_repo, mock_download
     ):
+        """The only text a user ever sees is the error message itself."""
         mock_download.side_effect = UnsupportedUrlError()
         msg = make_message("https://youtu.be/abc")
 
         await handlers.handle_private(msg, settings)
 
-        msg._status.delete.assert_awaited_once()
+        msg.answer.assert_awaited_once_with(UnsupportedUrlError.user_message)
 
     async def test_send_failure_is_caught(
         self, settings, tmp_path, mock_repo, mock_download
@@ -587,17 +586,6 @@ class TestAuditResilience:
         msg = make_message("https://youtu.be/abc")
 
         await handlers.handle_private(msg, settings)  # must not raise
-
-    async def test_status_delete_failure_ignored(
-        self, settings, tmp_path, mock_repo, mock_download
-    ):
-        mock_download.return_value = [make_media(tmp_path)]
-        msg = make_message("https://youtu.be/abc")
-        msg._status.delete = AsyncMock(side_effect=RuntimeError("already deleted"))
-
-        await handlers.handle_private(msg, settings)  # must not raise
-
-        mock_repo.mark_success.assert_awaited_once()
 
 
 class TestWorkdirCleanup:
