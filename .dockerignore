@@ -1,0 +1,28 @@
+# Keep the build context small and the image reproducible.
+# NOTE: uv.lock must NOT be ignored — the build runs `uv sync --frozen`.
+.git
+.gitignore
+.venv
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local state (compose injects .env at runtime via env_file).
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Docs and tests aren't needed in the runtime image.
+tests/
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

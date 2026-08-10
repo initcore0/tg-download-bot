@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    image: tgdl-bot:latest
+    container_name: tgdl-bot
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
