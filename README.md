@@ -19,8 +19,9 @@ media, makes it Telegram-compatible, and sends it straight back.
   groups and channels respond to `@yourbotname <link>` mentions.
 - **Clear errors.** Unsupported links, private/deleted media, oversized videos, and timeouts
   all produce a specific user-facing message.
-- **Audit database.** Every request is recorded in SQLite: who asked, the URL, the outcome,
-  timing, and the resulting Telegram `file_id`.
+- **Anonymous audit database.** Every request is recorded in SQLite — the URL, outcome,
+  timing, and resulting `file_id` — but **never who asked**. No user or chat identifiers
+  are stored (see [Privacy](#privacy)).
 - **Resilient extraction.** Transient throttling and YouTube bot-checks are retried with
   backoff and alternate player clients (with optional cookie support) instead of failing.
 - **Abuse-resistant.** Per-user concurrency limits, and an SSRF guard that refuses links
@@ -122,22 +123,39 @@ them with a bot-check. The bot handles this in two layers:
    Use a throwaway account; the cookies file is a credential — keep it out of git (the
    default `.gitignore` already excludes `data/`).
 
+## Privacy
+
+**The bot is anonymous by design. It never stores who sent a link.** There is no user
+table, and the audit database contains no Telegram user id, username, real name, chat id,
+or message id — nothing that identifies a person or ties requests back to one.
+
+The Telegram user id is used only *in memory*, and only for the per-user concurrency guard
+(so one user can't monopolize the download slots). It exists for the lifetime of a download
+and is never written to disk.
+
+If you are upgrading a database from an earlier version that *did* store identifying data,
+no action is needed: on startup the bot automatically drops the old `users` table and the
+`user_id` / `chat_id` / `message_id` columns, so previously collected identifiers are
+erased.
+
 ## The audit database
 
-Every request is recorded in SQLite at `DATABASE_PATH` (`data/tgdl.db` by default), created
-automatically on startup and running in WAL mode. There are two tables:
+Every request is recorded anonymously in SQLite at `DATABASE_PATH` (`data/tgdl.db` by
+default), created automatically on startup and running in WAL mode. There is a single
+table, **`requests`**, storing only:
 
-- **`users`** — Telegram id, username and names (refreshed on every interaction),
-  first/last seen timestamps, and a running request count.
-- **`requests`** — the requesting user and chat, the original and normalized URL, detected
-  platform, status (`pending` / `success` / `failed`), error class and message on failure,
-  media metadata (kind, title, size, duration, dimensions, whether it was transcoded), the
-  returned Telegram `file_id`, and timing.
+- the original and normalized URL, and the detected platform;
+- a coarse `chat_type` (`private` / `group` / `supergroup` / `channel`) — the only
+  contextual field, and deliberately non-identifying;
+- status (`pending` / `success` / `failed`) and, on failure, the error class and message;
+- media metadata: kind, title, size, duration, dimensions, whether it was transcoded;
+- the returned Telegram `file_id` and timing (created/completed timestamps, latency).
 
-All timestamps are stored as timezone-aware UTC. Recording the `file_id` lays the groundwork
-for re-sending previously downloaded media without re-downloading it; that optimization is
-not implemented yet. Audit writes are best-effort by design — a database problem is logged
-but never breaks a user's download.
+This is the data needed to drive a future popular-link cache (re-send by `file_id` instead
+of re-downloading) and to measure latency — none of which requires knowing the user.
+
+All timestamps are stored as timezone-aware UTC. Audit writes are best-effort by design — a
+database problem is logged but never breaks a user's download.
 
 Since WAL mode is enabled, the database is safe to query read-only while the bot is running:
 

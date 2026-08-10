@@ -59,6 +59,49 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker:
 
 
 async def create_all(engine: AsyncEngine) -> None:
-    """Create any missing tables/indexes. Idempotent."""
+    """Create any missing tables/indexes, then purge legacy identifying data. Idempotent."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_purge_legacy_identifying_data)
+
+
+# Columns that older versions stored on `requests` before the bot went anonymous.
+_LEGACY_IDENTIFYING_COLUMNS = ("user_id", "chat_id", "message_id")
+
+
+def _purge_legacy_identifying_data(sync_conn: Any) -> None:
+    """Retire identifying data left by pre-anonymity databases.
+
+    - Drop the old `users` table entirely.
+    - Drop `user_id` / `chat_id` / `message_id` from `requests` (SQLite >= 3.35 supports
+      DROP COLUMN; on older engines we fall back to nulling the values so nothing
+      identifying survives even if the column can't be removed).
+
+    Runs on every startup and is a no-op once the schema is clean.
+    """
+    from sqlalchemy import inspect, text
+    from sqlalchemy.exc import OperationalError
+
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+
+    if "users" in tables:
+        logger.warning("dropping legacy `users` table (bot is now anonymous)")
+        sync_conn.execute(text("DROP TABLE users"))
+
+    if "requests" not in tables:
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("requests")}
+    to_remove = [c for c in _LEGACY_IDENTIFYING_COLUMNS if c in existing]
+    for column in to_remove:
+        try:
+            sync_conn.execute(text(f"ALTER TABLE requests DROP COLUMN {column}"))
+            logger.warning("dropped legacy identifying column requests.%s", column)
+        except OperationalError:
+            # Old SQLite without DROP COLUMN: at least erase the values.
+            sync_conn.execute(text(f"UPDATE requests SET {column} = NULL"))
+            logger.warning(
+                "could not drop requests.%s (old SQLite); nulled its values instead",
+                column,
+            )

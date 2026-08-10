@@ -1,7 +1,8 @@
-"""Tests for the storage/audit layer (M3).
+"""Tests for the anonymous storage/audit layer (M3).
 
 Each test gets a fresh SQLite file under tmp_path and a fresh engine, so module-level
-repo state never leaks between tests.
+repo state never leaks between tests. The audit table is deliberately anonymous — one
+test asserts the schema carries no identifying columns.
 """
 from __future__ import annotations
 
@@ -10,11 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect
 
 from tgdl.downloader.models import MediaResult
 from tgdl.storage import repo
-from tgdl.storage.models import DownloadRequest, User
+from tgdl.storage.models import DownloadRequest
 
 
 @pytest.fixture
@@ -48,10 +49,7 @@ def make_media(**overrides) -> MediaResult:
 
 async def new_request(**overrides) -> DownloadRequest:
     kwargs = {
-        "user_id": None,
-        "chat_id": 555,
         "chat_type": "private",
-        "message_id": 1,
         "url": "https://youtube.com/watch?v=abc&utm_source=x",
         "normalized_url": "https://youtube.com/watch?v=abc",
         "platform": "youtube",
@@ -75,13 +73,36 @@ async def test_init_db_creates_file_parent_dir_and_tables(tmp_path: Path):
         async with repo._session() as session:
             conn = await session.connection()
             tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
-        assert {"users", "requests"} <= tables
+        assert "requests" in tables
+        assert "users" not in tables, "there must be no user table"
     finally:
         await repo.close_db()
 
 
+async def test_schema_has_no_identifying_columns(db_path: Path):
+    """Privacy regression guard: the audit table stores nothing that names a person."""
+    async with repo._session() as session:
+        conn = await session.connection()
+        columns = await conn.run_sync(
+            lambda c: {col["name"] for col in inspect(c).get_columns("requests")}
+        )
+
+    forbidden = {
+        "user_id",
+        "telegram_id",
+        "username",
+        "first_name",
+        "last_name",
+        "chat_id",
+        "message_id",
+    }
+    leaked = forbidden & columns
+    assert not leaked, f"identifying columns must not exist: {leaked}"
+    # The coarse, non-identifying context field is still present.
+    assert "chat_type" in columns
+
+
 async def test_init_db_enables_wal(db_path: Path):
-    # Read the pragma with a plain, independent connection.
     with sqlite3.connect(db_path) as conn:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert mode.lower() == "wal"
@@ -89,8 +110,8 @@ async def test_init_db_enables_wal(db_path: Path):
 
 async def test_init_db_is_idempotent(db_path: Path):
     await repo.init_db(db_path)  # second call must not blow up or wipe data
-    user = await repo.get_or_create_user(1, "u", "f", "l")
-    assert user.id is not None
+    request = await new_request()
+    assert request.id is not None
 
 
 async def test_expected_indexes_exist(db_path: Path):
@@ -101,81 +122,89 @@ async def test_expected_indexes_exist(db_path: Path):
         )
     assert {
         "ix_requests_normalized_url",
-        "ix_requests_user_id",
         "ix_requests_created_at",
     } <= indexes
+    assert "ix_requests_user_id" not in indexes
 
 
 async def test_close_db_then_reinit_works(db_path: Path):
-    user = await repo.get_or_create_user(777, "keep", "Keep", "Me")
+    request = await new_request()
     await repo.close_db()
 
     await repo.close_db()  # safe to call twice / when not initialized
 
     await repo.init_db(db_path)
     async with repo._session() as session:
-        again = (
-            await session.execute(select(User).where(User.telegram_id == 777))
-        ).scalar_one()
-    assert again.id == user.id
-    assert again.username == "keep"
+        again = await session.get(DownloadRequest, request.id)
+    assert again is not None
+    assert again.url == request.url
 
 
 async def test_calls_before_init_raise():
     await repo.close_db()
     with pytest.raises(RuntimeError, match="not initialized"):
-        await repo.get_or_create_user(1, None, None, None)
+        await new_request()
 
 
-# --------------------------------------------------------------------------- users
+# --------------------------------------------------- legacy-data purge (migration)
 
 
-async def test_get_or_create_user_creates(db_path: Path):
-    user = await repo.get_or_create_user(42, "alice", "Alice", "Smith")
+async def test_startup_purges_legacy_user_data(tmp_path: Path):
+    """A pre-anonymity DB (users table + identifying columns) is cleaned on init."""
+    path = tmp_path / "legacy.db"
+    # Build an "old" schema by hand, with identifying data in it.
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY, telegram_id BIGINT, username TEXT
+            );
+            INSERT INTO users (telegram_id, username) VALUES (777, 'alice');
+            CREATE TABLE requests (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER, chat_id BIGINT, message_id BIGINT,
+                chat_type TEXT NOT NULL,
+                url TEXT NOT NULL, normalized_url TEXT, platform TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_class TEXT, error_message TEXT,
+                media_kind TEXT, title TEXT, filesize_bytes BIGINT,
+                duration_s FLOAT, width INTEGER, height INTEGER,
+                transcoded BOOLEAN NOT NULL DEFAULT 0,
+                telegram_file_id TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME, elapsed_s FLOAT
+            );
+            INSERT INTO requests (user_id, chat_id, message_id, chat_type, url, status)
+            VALUES (1, 555, 42, 'private', 'https://youtube.com/watch?v=abc', 'success');
+            """
+        )
 
-    assert user.id is not None
-    assert user.telegram_id == 42
-    assert (user.username, user.first_name, user.last_name) == ("alice", "Alice", "Smith")
-    assert user.request_count == 1
-    assert user.first_seen_at.tzinfo is not None
-    assert user.last_seen_at.tzinfo is not None
+    await repo.init_db(path)
+    try:
+        async with repo._session() as session:
+            conn = await session.connection()
+            tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+            columns = await conn.run_sync(
+                lambda c: {col["name"] for col in inspect(c).get_columns("requests")}
+            )
+    finally:
+        await repo.close_db()
 
-
-async def test_get_or_create_user_updates_and_bumps_count(db_path: Path):
-    first = await repo.get_or_create_user(42, "alice", "Alice", "Smith")
-    first_seen = first.first_seen_at
-
-    second = await repo.get_or_create_user(42, "alice_new", "Alicia", "Jones")
-
-    assert second.id == first.id, "must not create a duplicate row"
-    assert second.username == "alice_new"
-    assert second.first_name == "Alicia"
-    assert second.last_name == "Jones"
-    assert second.request_count == 2
-    assert second.first_seen_at == first_seen, "first_seen_at is immutable"
-    assert second.last_seen_at >= first_seen
-
-    third = await repo.get_or_create_user(42, None, None, None)
-    assert third.request_count == 3
-    assert third.username is None, "cleared profile fields must be reflected"
-
-    async with repo._session() as session:
-        count = len((await session.execute(select(User))).scalars().all())
-    assert count == 1
-
-
-async def test_distinct_users_are_separate_rows(db_path: Path):
-    a = await repo.get_or_create_user(1, "a", None, None)
-    b = await repo.get_or_create_user(2, "b", None, None)
-    assert a.id != b.id
+    assert "users" not in tables, "legacy users table must be dropped"
+    assert {"user_id", "chat_id", "message_id"}.isdisjoint(columns), (
+        "legacy identifying columns must be gone"
+    )
+    # The pre-existing request row survives, minus its identifying fields.
+    with sqlite3.connect(path) as conn:
+        row = conn.execute("SELECT chat_type, url, status FROM requests").fetchone()
+    assert row == ("private", "https://youtube.com/watch?v=abc", "success")
 
 
 # ------------------------------------------------------------------------ requests
 
 
-async def test_create_request_persists_pending_row(db_path: Path):
-    user = await repo.get_or_create_user(42, "alice", "Alice", None)
-    request = await new_request(user_id=user.id, chat_type="group", message_id=99)
+async def test_create_request_persists_anonymous_pending_row(db_path: Path):
+    request = await new_request(chat_type="group")
 
     assert request.id is not None
     assert request.status == "pending"
@@ -185,24 +214,15 @@ async def test_create_request_persists_pending_row(db_path: Path):
     async with repo._session() as session:
         stored = await session.get(DownloadRequest, request.id)
         assert stored is not None
-        assert stored.user_id == user.id
-        assert stored.chat_id == 555
         assert stored.chat_type == "group"
-        assert stored.message_id == 99
+        assert stored.url == "https://youtube.com/watch?v=abc&utm_source=x"
         assert stored.normalized_url == "https://youtube.com/watch?v=abc"
         assert stored.platform == "youtube"
         assert stored.transcoded is False
 
 
-async def test_create_request_allows_null_user(db_path: Path):
-    request = await new_request(user_id=None, chat_type="channel", message_id=None)
-    assert request.id is not None
-    assert request.user_id is None
-
-
 async def test_mark_success_round_trip(db_path: Path):
-    user = await repo.get_or_create_user(42, "alice", "Alice", None)
-    request = await new_request(user_id=user.id)
+    request = await new_request()
     media = make_media()
 
     await repo.mark_success(request.id, media, "BAADBAADfile_id_123", 7.25)
@@ -336,7 +356,6 @@ async def test_mark_success_swallows_unexpected_media_errors(db_path: Path):
 
 async def test_stats_on_empty_db(db_path: Path):
     assert await repo.stats() == {
-        "users": 0,
         "requests": 0,
         "pending": 0,
         "success": 0,
@@ -345,18 +364,14 @@ async def test_stats_on_empty_db(db_path: Path):
 
 
 async def test_stats_counts(db_path: Path):
-    user = await repo.get_or_create_user(1, "a", None, None)
-    await repo.get_or_create_user(2, "b", None, None)
-
-    ok = await new_request(user_id=user.id)
-    bad = await new_request(user_id=user.id)
-    await new_request(user_id=user.id)  # stays pending
+    ok = await new_request()
+    bad = await new_request()
+    await new_request()  # stays pending
 
     await repo.mark_success(ok.id, make_media(), "fid", 1.0)
     await repo.mark_failure(bad.id, RuntimeError("nope"), 1.0)
 
     assert await repo.stats() == {
-        "users": 2,
         "requests": 3,
         "pending": 1,
         "success": 1,
@@ -370,25 +385,16 @@ async def test_stats_counts(db_path: Path):
 async def test_timestamps_are_utc_aware_after_reload(db_path: Path):
     """Values must come back tz-aware from disk, not just from the identity map."""
     before = datetime.now(UTC)
-    user = await repo.get_or_create_user(42, "alice", None, None)
-    request = await new_request(user_id=user.id)
+    request = await new_request()
     await repo.mark_success(request.id, make_media(), "fid", 1.0)
 
     await repo.close_db()
     await repo.init_db(db_path)
 
     async with repo._session() as session:
-        stored_user = (
-            await session.execute(select(User).where(User.telegram_id == 42))
-        ).scalar_one()
         stored_request = await session.get(DownloadRequest, request.id)
 
-    for value in (
-        stored_user.first_seen_at,
-        stored_user.last_seen_at,
-        stored_request.created_at,
-        stored_request.completed_at,
-    ):
+    for value in (stored_request.created_at, stored_request.completed_at):
         assert value.tzinfo is not None, "timestamps must be timezone-aware"
         assert value.utcoffset().total_seconds() == 0, "timestamps must be UTC"
         assert value >= before

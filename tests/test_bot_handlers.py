@@ -125,15 +125,13 @@ def make_media(
 @pytest.fixture
 def mock_repo(monkeypatch):
     """Patch every repo function used by handlers; returns the namespace of mocks."""
-    user_row = SimpleNamespace(id=5)
     request_row = SimpleNamespace(id=99)
     mocks = SimpleNamespace(
-        get_or_create_user=AsyncMock(return_value=user_row),
         create_request=AsyncMock(return_value=request_row),
         mark_success=AsyncMock(),
         mark_failure=AsyncMock(),
     )
-    for name in ("get_or_create_user", "create_request", "mark_success", "mark_failure"):
+    for name in ("create_request", "mark_success", "mark_failure"):
         monkeypatch.setattr(handlers.repo, name, getattr(mocks, name))
     return mocks
 
@@ -311,9 +309,10 @@ class TestRouting:
 
         mock_download.assert_awaited_once()
         msg.reply_video.assert_awaited_once()
-        # No from_user -> no user upsert, and the request is anonymous.
-        mock_repo.get_or_create_user.assert_not_awaited()
-        assert mock_repo.create_request.await_args.kwargs["user_id"] is None
+        # The request is recorded anonymously: only chat_type, no identifiers.
+        req = mock_repo.create_request.await_args.kwargs
+        assert req["chat_type"] == "channel"
+        assert "user_id" not in req and "chat_id" not in req and "message_id" not in req
 
     async def test_channel_post_without_mention_ignored(
         self, settings, mock_repo, mock_download
@@ -450,7 +449,7 @@ class TestSuccessFlow:
         msg.bot.send_chat_action.assert_awaited_once()
         assert msg.bot.send_chat_action.await_args.args[1] == "upload_video"
 
-    async def test_audit_user_and_request_recorded(
+    async def test_request_recorded_anonymously(
         self, settings, tmp_path, mock_repo, mock_download
     ):
         mock_download.return_value = [make_media(tmp_path)]
@@ -458,15 +457,14 @@ class TestSuccessFlow:
 
         await handlers.handle_private(msg, settings)
 
-        mock_repo.get_or_create_user.assert_awaited_once()
-        assert mock_repo.get_or_create_user.await_args.kwargs["telegram_id"] == 777
-
+        # Only anonymous fields are passed to the audit layer.
         req = mock_repo.create_request.await_args.kwargs
-        assert req["user_id"] == 5
-        assert req["chat_id"] == 111
-        assert req["message_id"] == 42
+        assert req["chat_type"] == "private"
         assert req["url"] == "https://youtu.be/abc"
         assert req["platform"] == "youtube"
+        # No identifying data is forwarded.
+        for identifying in ("user_id", "telegram_id", "chat_id", "message_id", "username"):
+            assert identifying not in req
 
 
 # ------------------------------------------------------------------ failure paths
@@ -569,7 +567,6 @@ class TestAuditResilience:
         self, settings, tmp_path, mock_repo, mock_download
     ):
         mock_download.return_value = [make_media(tmp_path)]
-        mock_repo.get_or_create_user.side_effect = RuntimeError("db down")
         mock_repo.create_request.side_effect = RuntimeError("db down")
         mock_repo.mark_success.side_effect = RuntimeError("db down")
         msg = make_message("https://youtu.be/abc")

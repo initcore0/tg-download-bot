@@ -107,34 +107,15 @@ def _is_group(message: Message) -> bool:
 
 
 # ------------------------------------------------------------------- audit wrappers
-# Audit must never break the user flow (ARCHITECTURE.md §6 / CLAUDE.md).
+# Audit must never break the user flow (ARCHITECTURE.md §6 / CLAUDE.md). Rows are
+# anonymous: we record only the link, platform, coarse chat_type, and performance
+# metadata — no user, chat, or message identifiers (see README "Privacy").
 
 
-async def _audit_user(message: Message) -> int | None:
-    """get_or_create_user for the sender; returns the DB user id or None."""
-    user = message.from_user
-    if user is None:  # channel posts have no from_user
-        return None
-    try:
-        row = await repo.get_or_create_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-        return getattr(row, "id", None)
-    except Exception:
-        log.exception("audit: get_or_create_user failed")
-        return None
-
-
-async def _audit_create_request(message: Message, user_id: int | None, url: str) -> int | None:
+async def _audit_create_request(message: Message, url: str) -> int | None:
     try:
         row = await repo.create_request(
-            user_id=user_id,
-            chat_id=message.chat.id,
             chat_type=str(message.chat.type),
-            message_id=message.message_id,
             url=url,
             normalized_url=_safe_normalized(url),
             platform=_safe_platform(url),
@@ -252,7 +233,12 @@ async def _send_results(
 
 
 def _user_key(message: Message) -> int:
-    """Per-user rate-limit key: the sender id, or the chat id for channel posts."""
+    """In-memory rate-limit key: the sender id, or chat id for channel posts.
+
+    Used ONLY for the transient per-user concurrency guard in `runtime` — it lives in
+    RAM for the duration of a download and is never written to the database. The audit
+    layer stores nothing derived from it.
+    """
     if message.from_user is not None:
         return message.from_user.id
     return message.chat.id
@@ -276,8 +262,7 @@ async def _run_download(
     message: Message, url: str, settings: Settings, *, quote: bool, started: float
 ) -> None:
     """The download+send+audit cycle, run while holding a user slot. Never raises."""
-    user_id = await _audit_user(message)
-    request_id = await _audit_create_request(message, user_id, url)
+    request_id = await _audit_create_request(message, url)
 
     # Immediate feedback ("sending a video…") even while queued on the semaphore;
     # ChatActionSender then keeps the status alive (actions expire after ~5s).

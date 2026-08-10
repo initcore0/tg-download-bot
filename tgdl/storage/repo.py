@@ -1,10 +1,12 @@
-"""Audit repository: users + download requests.
+"""Anonymous audit repository: download requests only.
 
-Signatures FROZEN (see ARCHITECTURE.md §6).
+There is no user table — requests are recorded without any identifying data (see
+DownloadRequest and README "Privacy"). We store links + performance metadata to drive
+a future popular-link cache, never who asked.
 
 Audit failures must never break the user flow: `mark_success` / `mark_failure` swallow
-and log their own exceptions. `get_or_create_user` / `create_request` may raise — the
-caller decides how to degrade.
+and log their own exceptions. `create_request` may raise — the caller decides how to
+degrade.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from tgdl.storage import db as _db
-from tgdl.storage.models import DownloadRequest, User
+from tgdl.storage.models import DownloadRequest
 
 if TYPE_CHECKING:
     from tgdl.downloader.models import MediaResult
@@ -75,59 +77,21 @@ async def close_db() -> None:
         await engine.dispose()
 
 
-async def get_or_create_user(
-    telegram_id: int,
-    username: str | None,
-    first_name: str | None,
-    last_name: str | None,
-) -> User:
-    """Upsert by telegram_id; refresh names, bump last_seen_at and request_count."""
-    now = _utcnow()
-    async with _session() as session:
-        async with session.begin():
-            user = (
-                await session.execute(select(User).where(User.telegram_id == telegram_id))
-            ).scalar_one_or_none()
-
-            if user is None:
-                user = User(
-                    telegram_id=telegram_id,
-                    username=username,
-                    first_name=first_name,
-                    last_name=last_name,
-                    first_seen_at=now,
-                    last_seen_at=now,
-                    request_count=1,
-                )
-                session.add(user)
-            else:
-                # Profile fields can change at any time — always refresh.
-                user.username = username
-                user.first_name = first_name
-                user.last_name = last_name
-                user.last_seen_at = now
-                user.request_count = (user.request_count or 0) + 1
-
-        return user
-
-
 async def create_request(
-    user_id: int | None,
-    chat_id: int,
     chat_type: str,
-    message_id: int | None,
     url: str,
     normalized_url: str,
     platform: str,
 ) -> DownloadRequest:
-    """Insert a request row with status='pending'; return it (id populated)."""
+    """Insert an anonymous request row with status='pending'; return it (id populated).
+
+    `chat_type` is the only contextual field kept, and it is coarse (private/group/
+    channel) — no user, chat, or message identifiers are stored.
+    """
     async with _session() as session:
         async with session.begin():
             request = DownloadRequest(
-                user_id=user_id,
-                chat_id=chat_id,
                 chat_type=chat_type,
-                message_id=message_id,
                 url=url,
                 normalized_url=normalized_url,
                 platform=platform,
@@ -188,9 +152,8 @@ async def mark_failure(request_id: int, error: BaseException, elapsed_s: float) 
 
 
 async def stats() -> dict[str, Any]:
-    """Small helper for ops: total users, total/succeeded/failed requests."""
+    """Small helper for ops: total/succeeded/failed requests (no user counts exist)."""
     async with _session() as session:
-        users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
         rows = (
             await session.execute(
                 select(DownloadRequest.status, func.count()).group_by(DownloadRequest.status)
@@ -199,7 +162,6 @@ async def stats() -> dict[str, Any]:
 
     by_status = {status: count for status, count in rows}
     return {
-        "users": users,
         "requests": sum(by_status.values()),
         "pending": by_status.get("pending", 0),
         "success": by_status.get("success", 0),

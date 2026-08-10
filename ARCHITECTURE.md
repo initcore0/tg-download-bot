@@ -50,7 +50,7 @@ Telegram update
   └─ bot/handlers.py
        1. Extract URL(s) from message text/entities (first supported URL wins).
           Private chat: any URL. Group/channel: only when @botusername is mentioned.
-       2. Audit: get_or_create_user + create_request  (storage/repo.py)
+       2. Audit: create_request — anonymous, no user/chat identifiers  (storage/repo.py)
        3. React immediately with the native chat-action status ("sending a video…"),
           kept alive via ChatActionSender for the whole download (actions expire ~5s);
           switched to "sending a photo…" during the upload phase when results are images.
@@ -123,27 +123,33 @@ galleries, no cache writes outside workdir. yt-dlp's blocking calls run via
 
 ## 6. Storage / audit (`tgdl/storage/`)
 
-SQLite at `DATABASE_PATH` (default `data/tgdl.db`), WAL mode. Tables created on startup
+SQLite at `DATABASE_PATH` (default `data/tgdl.db`), WAL mode. Table created on startup
 (`init_db()`); no migration tool needed yet.
 
+**Anonymous by design.** There is no user table and no identifying data. The audit exists
+to drive a future popular-link cache and to measure latency — neither needs to know who
+asked. The only contextual field is a coarse `chat_type`.
+
 ```
-users:    id PK, telegram_id UNIQUE NOT NULL, username, first_name, last_name,
-          first_seen_at, last_seen_at, request_count
-requests: id PK, user_id FK→users, chat_id, chat_type, message_id,
+requests: id PK, chat_type NOT NULL,          -- coarse: private|group|supergroup|channel
           url NOT NULL, normalized_url, platform,
           status (pending|success|failed), error_class, error_message,
           media_kind, title, filesize_bytes, duration_s, width, height,
           transcoded BOOL, telegram_file_id,      -- future cache key
           created_at, completed_at, elapsed_s
-Indexes: requests(normalized_url), requests(user_id), requests(created_at)
+Indexes: requests(normalized_url), requests(created_at)
 ```
+
+Deliberately **not** stored: Telegram user id, username, names, chat id, message id. The
+per-user rate-limit key (the Telegram id) lives only in memory (`tgdl/bot/runtime.py`) and
+is never persisted.
 
 `normalized_url`: lowercase host, strip tracking params (`utm_*`, `si`, `feature`…),
 resolve youtu.be→youtube.com/watch form — this is the future dedup key.
 
-Repo API (frozen signatures in `tgdl/storage/repo.py`): `init_db`, `get_or_create_user`,
-`create_request`, `mark_success`, `mark_failure`. All async. Audit failures must never
-break the user flow (log and continue).
+Repo API (`tgdl/storage/repo.py`): `init_db`, `create_request`, `mark_success`,
+`mark_failure`, `stats`. All async. Audit failures must never break the user flow (log and
+continue).
 
 ## 7. Bot layer (`tgdl/bot/`)
 
