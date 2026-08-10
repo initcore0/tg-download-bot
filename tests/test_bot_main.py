@@ -99,21 +99,21 @@ class TestRun:
         close_db.assert_awaited_once()
         bot.session.close.assert_awaited_once()
 
-    async def test_run_survives_storage_stub(self, monkeypatch, tmp_path):
-        """M3 is not implemented yet -> NotImplementedError must not stop the bot."""
+    async def test_run_fails_fast_on_invalid_token(self, monkeypatch, tmp_path):
+        """A 401 from Telegram -> SystemExit with a clear message, session still closed."""
         settings = Settings(
             telegram_bot_token="123:ABC", database_path=tmp_path / "db.sqlite"
         )
 
-        monkeypatch.setattr(
-            main_mod.repo, "init_db", AsyncMock(side_effect=NotImplementedError)
-        )
-        monkeypatch.setattr(
-            main_mod.repo, "close_db", AsyncMock(side_effect=NotImplementedError)
-        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
 
         bot = MagicMock()
-        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.me = AsyncMock(
+            side_effect=main_mod.TelegramUnauthorizedError(
+                method=MagicMock(), message="Unauthorized"
+            )
+        )
         bot.delete_webhook = AsyncMock()
         bot.session.close = AsyncMock()
         monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
@@ -123,9 +123,10 @@ class TestRun:
         dispatcher.__setitem__ = MagicMock()
         monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
 
-        await main_mod.run(settings)  # must not raise
+        with pytest.raises(SystemExit, match="401"):
+            await main_mod.run(settings)
 
-        dispatcher.start_polling.assert_awaited_once()
+        dispatcher.start_polling.assert_not_awaited()
         bot.session.close.assert_awaited_once()
 
     async def test_session_closed_even_when_polling_raises(self, monkeypatch, tmp_path):

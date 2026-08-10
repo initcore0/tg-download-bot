@@ -11,6 +11,7 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramUnauthorizedError
 
 from tgdl.bot import handlers, runtime
 from tgdl.config import Settings, load_settings
@@ -26,20 +27,23 @@ async def _resolve_username(bot: Bot) -> str | None:
     """Cache the bot's @username so group/channel mention matching works."""
     try:
         me = await bot.me()
-        runtime.set_bot_username(me.username)
-        log.info("running as @%s (id=%s)", me.username, me.id)
-        return me.username
+    except TelegramUnauthorizedError:
+        raise SystemExit(
+            "ERROR: Telegram rejected the bot token (401 Unauthorized). "
+            "Check TELEGRAM_BOT_TOKEN."
+        ) from None
     except Exception:
         log.exception("could not resolve bot username; mention handling may not work")
         return None
+    runtime.set_bot_username(me.username)
+    log.info("running as @%s (id=%s)", me.username, me.id)
+    return me.username
 
 
 async def run(settings: Settings) -> None:
     """Async entrypoint: init DB, start long polling, shut down cleanly."""
     try:
         await repo.init_db(settings.database_path)
-    except NotImplementedError:
-        log.warning("storage layer not implemented yet (M3) — running without audit DB")
     except Exception:
         log.exception("database init failed")
         raise
@@ -55,16 +59,14 @@ async def run(settings: Settings) -> None:
     dp["settings"] = settings
 
     runtime.configure(settings.max_concurrent_downloads)
-    await _resolve_username(bot)
 
     try:
+        await _resolve_username(bot)
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, handle_signals=True)
     finally:
         try:
             await repo.close_db()
-        except NotImplementedError:
-            pass
         except Exception:
             log.exception("error closing database")
         try:
@@ -91,7 +93,7 @@ def main() -> None:
 
     try:
         asyncio.run(run(settings))
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         log.info("shutting down")
 
 
