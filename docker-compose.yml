@@ -3,7 +3,12 @@ services:
     build: .
     image: tgdl-bot:latest
     container_name: tgdl-bot
-    env_file: .env
+    # Optional so hosted platforms (Coolify, etc.) that inject env vars directly
+    # don't fail when there's no .env file in the build context. For local runs,
+    # copy .env.example to .env and it will be picked up automatically.
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
     restart: unless-stopped
