@@ -19,6 +19,9 @@ media, makes it Telegram-compatible, and sends it straight back.
   groups and channels respond to `@yourbotname <link>` mentions.
 - **Clear errors.** Unsupported links, private/deleted media, oversized videos, and timeouts
   all produce a specific user-facing message.
+- **Bilingual (English + Russian).** Replies, help, and error messages are shown in Russian
+  to users whose Telegram language is set to Russian, and in English otherwise (see
+  [Languages](#languages)).
 - **Anonymous audit database.** Every request is recorded in SQLite — the URL, outcome,
   timing, and resulting `file_id` — but **never who asked**. No user or chat identifiers
   are stored (see [Privacy](#privacy)).
@@ -137,6 +140,21 @@ If you are upgrading a database from an earlier version that *did* store identif
 no action is needed: on startup the bot automatically drops the old `users` table and the
 `user_id` / `chat_id` / `message_id` columns, so previously collected identifiers are
 erased.
+
+## Languages
+
+The bot speaks **English** and **Russian**. Every reply — `/start`, `/help`, the
+per-user "busy" notice, and all error messages — is rendered in the language matching the
+user's Telegram client (`from_user.language_code`): Russian for `ru` / `ru-RU`, English for
+everything else, including when no language is reported.
+
+The choice is made per message and nothing is stored, so this is fully compatible with the
+anonymity guarantee above. Channel posts (which have no associated user) default to English.
+
+All strings live in a single catalog, [`tgdl/i18n.py`](tgdl/i18n.py), keyed by message id
+with an `en` and `ru` variant each; download errors carry a stable `message_key` that the
+bot translates at send time, so the downloader stays language-agnostic. To add a language,
+add its variants to that catalog and extend `SUPPORTED_LOCALES`.
 
 ## The audit database
 

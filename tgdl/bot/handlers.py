@@ -19,6 +19,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, InputMediaPhoto, Message
 from aiogram.utils.chat_action import ChatActionSender
 
+from tgdl import i18n
 from tgdl.bot import responses, runtime
 from tgdl.config import Settings
 from tgdl.downloader import service
@@ -244,22 +245,33 @@ def _user_key(message: Message) -> int:
     return message.chat.id
 
 
+def _locale(message: Message) -> str:
+    """Pick the reply language from the sender's Telegram language_code.
+
+    Used only to render this reply; never stored (keeps the bot anonymous). Channel
+    posts have no from_user, so they fall back to the default locale (English).
+    """
+    code = message.from_user.language_code if message.from_user is not None else None
+    return i18n.locale_of(code)
+
+
 async def process_url(message: Message, url: str, settings: Settings) -> None:
     """Full download+send+audit cycle for one URL. Never raises."""
     quote = _is_group(message) or message.chat.type == ChatType.CHANNEL
+    locale = _locale(message)
     started = time.monotonic()
 
     # Per-user abuse guard: refuse a new download while this user already has one
     # in flight, so a single user cannot monopolize the global download slots.
     with runtime.user_slot(_user_key(message)) as granted:
         if not granted:
-            await _reply(message, responses.BUSY_PER_USER, quote=quote)
+            await _reply(message, responses.busy_per_user(locale), quote=quote)
             return
-        await _run_download(message, url, settings, quote=quote, started=started)
+        await _run_download(message, url, settings, quote=quote, started=started, locale=locale)
 
 
 async def _run_download(
-    message: Message, url: str, settings: Settings, *, quote: bool, started: float
+    message: Message, url: str, settings: Settings, *, quote: bool, started: float, locale: str
 ) -> None:
     """The download+send+audit cycle, run while holding a user slot. Never raises."""
     request_id = await _audit_create_request(message, url)
@@ -305,12 +317,14 @@ async def _run_download(
 
     except DownloadError as err:
         log.info("download failed for %s: %s", url, err)
-        await _reply(message, err.user_message, quote=quote)
+        # A caller-supplied custom message is shown verbatim; otherwise translate.
+        text = err.custom_message or i18n.t(err.message_key, locale)
+        await _reply(message, text, quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
     except Exception as err:
         # Top-level guard: an unexpected error must never kill the polling loop.
         log.exception("unexpected error handling %s", url)
-        await _reply(message, responses.GENERIC_ERROR, quote=quote)
+        await _reply(message, responses.generic_error(locale), quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
     finally:
         if workdir is not None:
@@ -322,12 +336,12 @@ async def _run_download(
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(responses.start_text(runtime.get_bot_username()))
+    await message.answer(responses.start_text(runtime.get_bot_username(), _locale(message)))
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(responses.help_text(runtime.get_bot_username()))
+    await message.answer(responses.help_text(runtime.get_bot_username(), _locale(message)))
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)

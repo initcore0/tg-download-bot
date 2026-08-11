@@ -159,9 +159,16 @@ continue).
 - Upload via `FSInputFile`; `sendVideo(width, height, duration, supports_streaming=True)`.
 - Store returned `message.video.file_id` into the audit row.
 - Per-chat politeness: reply_to the triggering message in groups; plain send in private.
-- Errors: `DownloadError.user_message` shown to user; unexpected exceptions → generic
-  "Something went wrong" + full traceback in logs.
+- Errors: the localized message for `DownloadError.message_key` (or a caller-supplied
+  `custom_message`) shown to user; unexpected exceptions → generic "Something went wrong"
+  + full traceback in logs.
 - Graceful shutdown: cancel in-flight tasks, close DB.
+
+**Localization (`tgdl/i18n.py`).** EN + RU. Locale is resolved per message from
+`from_user.language_code` (`ru`/`ru-RU` → Russian, else English; channel posts → English)
+and never stored, so it doesn't affect anonymity. All user-facing strings live in one
+catalog keyed by message id. The downloader is language-agnostic: each `DownloadError`
+carries a stable `message_key`, and the bot translates it at send time.
 
 ## 8. Config (env / `.env` — see `.env.example`)
 

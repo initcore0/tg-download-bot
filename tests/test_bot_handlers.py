@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tgdl.bot import handlers, responses, runtime
+from tgdl import i18n
+from tgdl.bot import handlers, runtime
 from tgdl.config import Settings
 from tgdl.downloader.models import (
     DownloadError,
@@ -49,6 +50,7 @@ def make_message(
     message_id: int = 42,
     from_user: bool = True,
     user_id: int = 777,
+    language_code: str | None = None,
     caption: str | None = None,
 ) -> MagicMock:
     """A Message test double with AsyncMock send methods."""
@@ -60,7 +62,8 @@ def make_message(
 
     if from_user:
         msg.from_user = SimpleNamespace(
-            id=user_id, username="alice", first_name="Alice", last_name="A"
+            id=user_id, username="alice", first_name="Alice", last_name="A",
+            language_code=language_code,
         )
     else:
         msg.from_user = None
@@ -223,6 +226,67 @@ class TestCommands:
         msg.answer.assert_awaited_once()
         text = msg.answer.await_args.args[0]
         assert "/start" in text and "/help" in text
+
+
+class TestLocalization:
+    async def test_start_default_is_english(self):
+        msg = make_message("/start", language_code=None)
+        await handlers.cmd_start(msg)
+        assert msg.answer.await_args.args[0] == i18n.t("start", "en", username=BOT_USERNAME)
+
+    async def test_help_russian_for_ru_user(self):
+        msg = make_message("/help", language_code="ru-RU")
+        await handlers.cmd_help(msg)
+        text = msg.answer.await_args.args[0]
+        assert text == i18n.t("help", "ru", username=BOT_USERNAME)
+        assert "Как мной пользоваться" in text  # sanity: actually Russian
+
+    async def test_english_for_unsupported_language(self):
+        msg = make_message("/help", language_code="de")
+        await handlers.cmd_help(msg)
+        assert msg.answer.await_args.args[0] == i18n.t("help", "en", username=BOT_USERNAME)
+
+    async def test_download_error_localized_to_russian(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_download.side_effect = UnsupportedUrlError()
+        msg = make_message("https://youtu.be/abc", language_code="ru")
+
+        await handlers.handle_private(msg, settings)
+
+        sent = [c.args[0] for c in msg.answer.await_args_list]
+        assert i18n.t("error.unsupported_url", "ru") in sent
+        assert i18n.t("error.unsupported_url", "en") not in sent
+
+    async def test_busy_message_localized_to_russian(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        runtime.reset()
+        runtime.configure(5, BOT_USERNAME, max_per_user=1)
+
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _download(url, workdir, **kwargs):
+            started.set()
+            await release.wait()
+            return [make_media(Path(workdir))]
+
+        mock_download.side_effect = _download
+
+        first = asyncio.create_task(
+            handlers.handle_private(
+                make_message("https://youtu.be/abc", user_id=42, language_code="ru"), settings
+            )
+        )
+        await started.wait()
+        second = make_message("https://youtu.be/def", user_id=42, language_code="ru")
+        await handlers.handle_private(second, settings)
+
+        second.answer.assert_awaited_once_with(i18n.t("busy_per_user", "ru"))
+
+        release.set()
+        await first
 
 
 # ------------------------------------------------------------------ routing rules
@@ -482,7 +546,7 @@ class TestFailureFlow:
 
         # The user sees the friendly message, not the internal detail.
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
-        assert MediaTooLargeError.user_message in sent_texts
+        assert i18n.t("error.too_large", "en") in sent_texts
         assert "1.2GB" not in " ".join(sent_texts)
 
         mock_repo.mark_failure.assert_awaited_once()
@@ -498,7 +562,7 @@ class TestFailureFlow:
         await handlers.handle_private(msg, settings)
 
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
-        assert UnsupportedUrlError.user_message in sent_texts
+        assert i18n.t("error.unsupported_url", "en") in sent_texts
 
     async def test_group_error_is_replied(self, settings, mock_repo, mock_download):
         mock_download.side_effect = UnsupportedUrlError()
@@ -507,7 +571,7 @@ class TestFailureFlow:
         await handlers.handle_group(msg, settings)
 
         sent_texts = [c.args[0] for c in msg.reply.await_args_list]
-        assert UnsupportedUrlError.user_message in sent_texts
+        assert i18n.t("error.unsupported_url", "en") in sent_texts
 
     async def test_unexpected_exception_shows_generic_message(
         self, settings, mock_repo, mock_download
@@ -519,7 +583,7 @@ class TestFailureFlow:
         await handlers.handle_private(msg, settings)
 
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
-        assert responses.GENERIC_ERROR in sent_texts
+        assert i18n.t("generic_error", "en") in sent_texts
         assert "ffmpeg exploded" not in " ".join(sent_texts)
         assert mock_repo.mark_failure.await_args.kwargs["error"] is boom
 
@@ -543,7 +607,7 @@ class TestFailureFlow:
 
         await handlers.handle_private(msg, settings)
 
-        msg.answer.assert_awaited_once_with(UnsupportedUrlError.user_message)
+        msg.answer.assert_awaited_once_with(i18n.t("error.unsupported_url", "en"))
 
     async def test_send_failure_is_caught(
         self, settings, tmp_path, mock_repo, mock_download
@@ -555,7 +619,7 @@ class TestFailureFlow:
         await handlers.handle_private(msg, settings)  # must not raise
 
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
-        assert responses.GENERIC_ERROR in sent_texts
+        assert i18n.t("generic_error", "en") in sent_texts
         mock_repo.mark_failure.assert_awaited_once()
 
 
@@ -701,7 +765,7 @@ class TestConcurrency:
         await handlers.handle_private(second_msg, settings)
 
         # The second was rejected immediately with the busy message; no download ran.
-        second_msg.answer.assert_awaited_once_with(responses.BUSY_PER_USER)
+        second_msg.answer.assert_awaited_once_with(i18n.t("busy_per_user", "en"))
         assert mock_download.await_count == 1
 
         release.set()
@@ -753,7 +817,7 @@ class TestDownloadErrorBase:
         await handlers.handle_private(msg, settings)
 
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
-        assert DownloadError.user_message in sent_texts
+        assert i18n.t("error.generic", "en") in sent_texts
 
     async def test_custom_user_message_is_used(
         self, settings, mock_repo, mock_download
