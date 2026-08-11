@@ -208,6 +208,9 @@ def _extract_sync(url: str, opts: dict[str, Any], *, download: bool) -> dict[str
     """Blocking yt-dlp call — always invoked through `asyncio.to_thread`."""
     import yt_dlp  # imported lazily so tests can patch/skip it cheaply
 
+    from tgdl.downloader import ytdlp_patches
+
+    ytdlp_patches.apply()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
