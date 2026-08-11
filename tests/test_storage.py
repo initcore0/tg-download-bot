@@ -217,6 +217,50 @@ async def test_startup_purges_legacy_user_data(tmp_path: Path):
     assert row == ("private", "https://youtube.com/watch?v=abc", "success")
 
 
+async def test_startup_repairs_dangling_user_id_fk(tmp_path: Path):
+    """Repair a DB broken by the old migration: `users` dropped, FK column left behind.
+
+    Older SQlite (e.g. 3.40 in Debian bookworm) refuses `DROP COLUMN user_id` because
+    of its FK, and the previous migration then dropped `users` anyway. That left every
+    INSERT into `requests` failing with "no such table: main.users" in production.
+    """
+    path = tmp_path / "broken.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_LEGACY_SCHEMA)
+        # Reproduce the old migration's fallback end-state.
+        conn.execute("UPDATE requests SET user_id = NULL")
+        conn.execute("DROP TABLE users")
+
+    await repo.init_db(path)
+    try:
+        async with repo._session() as session:
+            conn = await session.connection()
+            columns = await conn.run_sync(
+                lambda c: {col["name"] for col in inspect(c).get_columns("requests")}
+            )
+        # The write that failed in production must now succeed.
+        await repo.create_request(
+            chat_type="private",
+            url="https://x.com/i/status/9",
+            normalized_url="https://x.com/i/status/9",
+            platform="twitter",
+        )
+    finally:
+        await repo.close_db()
+
+    assert {"user_id", "chat_id", "message_id"}.isdisjoint(columns)
+    # The dangling FK is really gone from the schema, not just the column list.
+    with sqlite3.connect(path) as conn:
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT chat_type, url, status FROM requests WHERE id = 1"
+        ).fetchone()
+    assert "users" not in ddl
+    assert row == ("private", "https://youtube.com/watch?v=abc", "success")
+
+
 async def test_legacy_purge_is_idempotent(tmp_path: Path):
     """Running init twice over a legacy DB must not fail the second time."""
     path = tmp_path / "legacy2.db"
