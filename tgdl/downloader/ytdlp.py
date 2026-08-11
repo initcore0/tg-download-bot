@@ -25,8 +25,10 @@ _UNSUPPORTED_MARKERS = (
     "no media found",
 )
 
-# Errors that are private/removed content — permanent, but not "unsupported".
+# Errors that are private/removed/absent content — permanent, but not "unsupported".
 _PERMANENT_MARKERS = (
+    "no video could be found",  # twitter: tweet exists but has no video
+    "there is no video in this post",  # instagram: post exists but has no video
     "private video",
     "video unavailable",
     "this video is unavailable",
