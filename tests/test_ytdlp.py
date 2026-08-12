@@ -33,6 +33,8 @@ class TestClassify:
             "Video unavailable. This video has been removed by the user",
             "This video is not available",
             "This live event will begin in 3 hours",
+            "ERROR: [twitter] 1234567890: No video could be found in this tweet",
+            "ERROR: [instagram] CxYz: There is no video in this post",
         ],
     )
     def test_permanent_extraction(self, message):
@@ -104,6 +106,23 @@ class TestRetry:
         with pytest.raises(UnsupportedUrlError):
             await ytdlp.extract("https://x.invalid/a", tmp_path, max_height=720)
         assert calls["n"] == 1  # no retries
+
+    async def test_tweet_without_video_fails_fast(self, monkeypatch, tmp_path):
+        calls = {"n": 0}
+
+        def fake_sync(url, opts, *, download):
+            calls["n"] += 1
+            raise ytdlp._classify(
+                Exception("ERROR: [twitter] 1234567890: No video could be found in this tweet")
+            )
+
+        monkeypatch.setattr(ytdlp, "_extract_sync", fake_sync)
+        monkeypatch.setattr(ytdlp.asyncio, "sleep", _no_sleep)
+
+        with pytest.raises(ExtractionError) as excinfo:
+            await ytdlp.extract("https://x.com/u/status/1234567890", tmp_path, max_height=720)
+        assert not isinstance(excinfo.value, TransientExtractionError)
+        assert calls["n"] == 1  # permanent — no retries, no backoff
 
     async def test_gives_up_after_max_attempts_with_transient(self, monkeypatch, tmp_path):
         calls = {"n": 0}

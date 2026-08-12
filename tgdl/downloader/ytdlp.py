@@ -30,8 +30,8 @@ _UNSUPPORTED_MARKERS = (
 # gallery-dl image fallback, so they must never be classified as transient
 # (which would waste ~15s of retries before the fallback can run).
 _NO_VIDEO_MARKERS = (
-    "there is no video in this post",
-    "no video could be found in this tweet",
+    "there is no video in this post",  # instagram: post exists but has no video
+    "no video could be found",  # twitter: tweet exists but has no video
     "no video formats found",
     "no videos found",
     "does not contain a video",
@@ -220,6 +220,9 @@ def _extract_sync(url: str, opts: dict[str, Any], *, download: bool) -> dict[str
     """Blocking yt-dlp call — always invoked through `asyncio.to_thread`."""
     import yt_dlp  # imported lazily so tests can patch/skip it cheaply
 
+    from tgdl.downloader import ytdlp_patches
+
+    ytdlp_patches.apply()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
