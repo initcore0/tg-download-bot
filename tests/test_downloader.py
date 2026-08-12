@@ -207,6 +207,156 @@ class TestGalleries:
         assert results[0].path.name == "good.jpg"
 
 
+class TestImageFallback:
+    """yt-dlp finds no video -> the gallery-dl image engine takes over."""
+
+    def _stub_fetch(self, monkeypatch, sources: list[Path] | None, *, error=None, calls=None):
+        async def _fetch(url, workdir, *, max_items=10):
+            if calls is not None:
+                calls.append(url)
+            if error is not None:
+                raise error
+            dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
+            dest.mkdir(parents=True, exist_ok=True)
+            out = []
+            for index, src in enumerate(sources or []):
+                dst = dest / f"item{index}{src.suffix}"
+                shutil.copy(src, dst)
+                out.append(dst)
+            return out
+
+        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+
+    async def test_no_video_post_falls_back_to_images(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        stub_extract([], error=ExtractionError("There is no video in this post"))
+        self._stub_fetch(monkeypatch, [jpg_file, jpg_file])
+        results = await service.download_media(
+            "https://instagram.com/p/photos", tmp_path, max_size_bytes=CAP
+        )
+        assert len(results) == 2
+        assert all(r.kind == "image" for r in results)
+        assert all(r.platform == "instagram" for r in results)
+
+    async def test_fallback_handles_story_videos_too(
+        self, stub_extract, monkeypatch, jpg_file, h264_mp4, tmp_path
+    ):
+        stub_extract([], error=ExtractionError("no video"))
+        self._stub_fetch(monkeypatch, [jpg_file, h264_mp4])
+        results = await service.download_media(
+            "https://twitter.com/u/status/1", tmp_path, max_size_bytes=CAP
+        )
+        assert [r.kind for r in results] == ["image", "video"]
+
+    async def test_fallback_failure_reraises_original_error(
+        self, stub_extract, monkeypatch, tmp_path
+    ):
+        original = ExtractionError("There is no video in this post")
+        stub_extract([], error=original)
+        self._stub_fetch(monkeypatch, None, error=ExtractionError("gallery-dl failed too"))
+        with pytest.raises(ExtractionError) as excinfo:
+            await service.download_media(
+                "https://instagram.com/p/x", tmp_path, max_size_bytes=CAP
+            )
+        assert excinfo.value is original
+
+    async def test_fallback_auth_error_wins_over_original(
+        self, stub_extract, monkeypatch, tmp_path
+    ):
+        from tgdl.downloader.gallerydl import AuthRequiredError
+
+        stub_extract([], error=ExtractionError("Requested content is not available"))
+        self._stub_fetch(monkeypatch, None, error=AuthRequiredError("login required"))
+        with pytest.raises(AuthRequiredError):
+            await service.download_media(
+                "https://instagram.com/p/x", tmp_path, max_size_bytes=CAP
+            )
+
+    async def test_unsupported_url_also_tries_fallback(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        # gallery-dl covers image hosts yt-dlp has no extractor for.
+        stub_extract([], error=UnsupportedUrlError("Unsupported URL"))
+        self._stub_fetch(monkeypatch, [jpg_file])
+        (result,) = await service.download_media(
+            "https://pinterest.com/pin/123", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "image"
+
+    async def test_success_never_touches_fallback(
+        self, stub_extract, monkeypatch, h264_mp4, tmp_path
+    ):
+        calls: list[str] = []
+        stub_extract([h264_mp4])
+        self._stub_fetch(monkeypatch, [], calls=calls)
+        await service.download_media("https://youtube.com/watch?v=x", tmp_path, max_size_bytes=CAP)
+        assert calls == []
+
+    async def test_corrupt_fallback_file_among_good_ones_is_skipped(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        stub_extract([], error=ExtractionError("no video"))
+
+        async def _fetch(url, workdir, *, max_items=10):
+            dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
+            dest.mkdir(parents=True, exist_ok=True)
+            good = dest / "good.jpg"
+            shutil.copy(jpg_file, good)
+            bad = dest / "bad.jpg"
+            bad.write_bytes(b"not an image")
+            return [good, bad]
+
+        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+        results = await service.download_media(
+            "https://instagram.com/p/x", tmp_path, max_size_bytes=CAP
+        )
+        assert [r.path.name for r in results] == ["good.jpg"]
+
+
+class TestStories:
+    async def test_story_without_cookies_fails_fast_with_auth_error(
+        self, monkeypatch, tmp_path
+    ):
+        from tgdl.downloader.gallerydl import AuthRequiredError
+
+        called = []
+
+        async def _extract(*args, **kwargs):
+            called.append(True)
+            raise AssertionError("ytdlp.extract must not run for cookie-less stories")
+
+        monkeypatch.setattr(service.ytdlp, "extract", _extract)
+        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: False)
+        with pytest.raises(AuthRequiredError):
+            await service.download_media(
+                "https://www.instagram.com/stories/someuser/123456/",
+                tmp_path,
+                max_size_bytes=CAP,
+            )
+        assert not called
+
+    async def test_story_with_cookies_goes_through_normal_pipeline(
+        self, stub_extract, monkeypatch, h264_mp4, tmp_path
+    ):
+        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: True)
+        stub_extract([h264_mp4])
+        (result,) = await service.download_media(
+            "https://instagram.com/stories/someuser/123/", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "video"
+
+    async def test_non_story_instagram_needs_no_cookies(
+        self, stub_extract, monkeypatch, h264_mp4, tmp_path
+    ):
+        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: False)
+        stub_extract([h264_mp4])
+        (result,) = await service.download_media(
+            "https://instagram.com/reel/abc/", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "video"
+
+
 class TestSizeCap:
     async def test_under_cap_is_untouched(self, stub_extract, h264_mp4, tmp_path):
         stub_extract([h264_mp4])

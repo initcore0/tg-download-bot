@@ -9,6 +9,11 @@ media, makes it Telegram-compatible, and sends it straight back.
 ## Features
 
 - **Broad platform support** via yt-dlp (hundreds of sites, not just the ones listed above).
+- **Photos, carousels, and stories too.** Image-only posts (Instagram photos, image
+  tweets, Pinterest pins, …) are fetched through a
+  [gallery-dl](https://github.com/mikf/gallery-dl) fallback engine and sent as photos
+  (albums for carousels). Instagram stories work when a cookies file is configured
+  (they are always login-gated — see [Configuration](#configuration)).
 - **Latency first.** Prefers source formats that are already H.264/AAC MP4 so it can
   stream-copy instead of re-encoding; capped at 720p. Transcoding is a fallback, not the norm.
 - **Plain output.** No captions, no links, no watermarks, no branding — the media arrives
@@ -109,7 +114,8 @@ All settings are read from the environment or a `.env` file. Only the token is r
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Global cap on simultaneous downloads. |
 | `MAX_PER_USER_CONCURRENT` | `1` | Max in-flight downloads per user (abuse guard). |
 | `DOWNLOAD_TIMEOUT_S` | `300` | Per-request timeout in seconds. |
-| `YOUTUBE_COOKIES_FILE` | — | Optional cookies.txt to bypass YouTube's bot-check (see below). |
+| `COOKIES_FILE` | — | Optional cookies.txt shared by both download engines; unlocks Instagram stories and login-gated posts, and bypasses YouTube's bot-check (see below). |
+| `YOUTUBE_COOKIES_FILE` | — | Legacy alias for `COOKIES_FILE` (used when `COOKIES_FILE` is unset). |
 | `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, …). |
 
 ### YouTube "Sign in to confirm you're not a bot"

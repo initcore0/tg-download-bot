@@ -25,6 +25,18 @@ _UNSUPPORTED_MARKERS = (
     "no media found",
 )
 
+# Errors that mean "this post exists but holds no video" — image-only posts.
+# Permanent for yt-dlp, but the service layer retries these through the
+# gallery-dl image fallback, so they must never be classified as transient
+# (which would waste ~15s of retries before the fallback can run).
+_NO_VIDEO_MARKERS = (
+    "there is no video in this post",
+    "no video could be found in this tweet",
+    "no video formats found",
+    "no videos found",
+    "does not contain a video",
+)
+
 # Errors that are private/removed content — permanent, but not "unsupported".
 _PERMANENT_MARKERS = (
     "private video",
@@ -163,6 +175,8 @@ def _classify(exc: Exception) -> Exception:
     """
     message = str(exc)
     lowered = message.lower()
+    if any(marker in lowered for marker in _NO_VIDEO_MARKERS):
+        return ExtractionError(message)
     if any(marker in lowered for marker in _TRANSIENT_MARKERS):
         return TransientExtractionError(message)
     if any(marker in lowered for marker in _PERMANENT_MARKERS):
