@@ -82,9 +82,14 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-The compose service reads `.env`, mounts `./data` into the container for the SQLite
-database and temporary download workdirs, and restarts automatically unless explicitly
-stopped. The container runs as a non-root user.
+The compose service reads `.env`, stores the SQLite database and temporary download
+workdirs in a named Docker volume (`tgdl-data`, mounted at `/app/data`), and restarts
+automatically unless explicitly stopped. The container runs as a non-root user.
+
+A named volume — rather than a `./data` bind mount — is what makes the audit database
+survive redeploys on platforms like Coolify, which recreate the compose working
+directory on every deployment. To inspect or back up the data, go through the
+container (e.g. `docker compose exec bot sqlite3 data/tgdl.db ...` or `docker cp`).
 
 To stop it:
 
@@ -191,7 +196,15 @@ Since WAL mode is enabled, the database is safe to query read-only while the bot
 sqlite3 data/tgdl.db "SELECT status, COUNT(*) FROM requests GROUP BY status;"
 ```
 
-Back up the whole `data/` directory (including the `-wal` and `-shm` files) to preserve history.
+Under Docker the data lives in the `tgdl-data` named volume; the image has no sqlite3
+CLI, so query through the container's Python:
+
+```bash
+docker compose exec bot python -c "import sqlite3; [print(r) for r in sqlite3.connect('file:data/tgdl.db?mode=ro', uri=True).execute('SELECT status, COUNT(*) FROM requests GROUP BY status')]"
+```
+
+Back up the whole data directory (including the `-wal` and `-shm` files) to preserve
+history — locally that's `data/`; under Docker, e.g. `docker cp tgdl-bot:/app/data ./backup`.
 
 ## Development
 

@@ -9,6 +9,14 @@ services:
     env_file:
       - path: .env
         required: false
+    # Named volume, NOT a ./data bind mount: Coolify (and similar platforms)
+    # recreate the compose working directory on every redeploy, so a relative
+    # bind mount would silently reset the SQLite audit DB each time. A named
+    # volume lives in Docker's own storage and survives redeploys; the
+    # entrypoint fixes its root ownership on first start.
     volumes:
-      - ./data:/app/data
+      - tgdl-data:/app/data
     restart: unless-stopped
+
+volumes:
+  tgdl-data:
