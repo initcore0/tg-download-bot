@@ -138,10 +138,16 @@ actionable `AuthRequiredError` ("error.login_required") wins.
 
 **Stories.** `instagram.com/stories/...` is always login-gated: with no cookies file
 configured the service fails fast with `AuthRequiredError` before either engine runs.
-A single Netscape `cookies.txt` is shared by both engines — preferably as env-var
-*content* (`COOKIES`, raw or base64, materialized to a 0600 temp file at startup;
-legacy alias `YOUTUBE_COOKIES`), or as a file path (`COOKIES_FILE`, legacy alias
-`YOUTUBE_COOKIES_FILE`). Content wins over path.
+**Cookie routing (`tgdl/downloader/cookies.py`).** Cookies live in per-platform jars
+so each site only ever receives its own credentials: `YOUTUBE_COOKIES` is used only
+for YouTube, `INSTAGRAM_COOKIES` only for Instagram, and `COOKIES` is the generic
+fallback for platforms without a dedicated jar. Instagram posts/reels are fetched
+**anonymously** by design (an always-on session on public content is what gets
+accounts flagged); the Instagram jar is used for stories, plus one automatic retry
+when an anonymous attempt hits a login wall. Each jar is set either as env-var
+*content* (raw or base64, materialized to a 0600 temp file at startup) or as a
+`*_FILE` path; content wins over path. Both engines receive the resolved jar
+per-request (`cookies_file=` parameter), not via global state.
 
 ## 6. Storage / audit (`tgdl/storage/`)
 
@@ -203,11 +209,13 @@ MAX_HEIGHT           default 720
 MAX_CONCURRENT_DOWNLOADS default 3
 DOWNLOAD_TIMEOUT_S   default 300
 LOG_LEVEL            default INFO
-COOKIES              optional Netscape cookies.txt CONTENT (raw or base64) shared by
-                     yt-dlp + gallery-dl (YouTube bot-check, Instagram stories/
-                     login-gated posts); legacy alias YOUTUBE_COOKIES
-COOKIES_FILE         same, as a file path; content vars win when both are set;
-                     legacy alias YOUTUBE_COOKIES_FILE
+YOUTUBE_COOKIES      Netscape cookies.txt CONTENT (raw or base64), used only for
+                     YouTube (bot-check bypass)
+INSTAGRAM_COOKIES    same, used only for Instagram (stories + login-wall retry;
+                     public posts stay anonymous)
+COOKIES              same, generic jar for platforms without a dedicated one
+*_COOKIES_FILE       file-path variant of each jar (COOKIES_FILE,
+                     YOUTUBE_COOKIES_FILE, INSTAGRAM_COOKIES_FILE); content wins
 ```
 
 ## 9. Module ownership & boundaries (for parallel build agents)

@@ -12,7 +12,7 @@ media, makes it Telegram-compatible, and sends it straight back.
 - **Photos, carousels, and stories too.** Image-only posts (Instagram photos, image
   tweets, Pinterest pins, …) are fetched through a
   [gallery-dl](https://github.com/mikf/gallery-dl) fallback engine and sent as photos
-  (albums for carousels). Instagram stories work when a cookies file is configured
+  (albums for carousels). Instagram stories work when Instagram cookies are configured
   (they are always login-gated — see [Configuration](#configuration)).
 - **Latency first.** Prefers source formats that are already H.264/AAC MP4 so it can
   stream-copy instead of re-encoding; capped at 720p. Transcoding is a fallback, not the norm.
@@ -119,10 +119,10 @@ All settings are read from the environment or a `.env` file. Only the token is r
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Global cap on simultaneous downloads. |
 | `MAX_PER_USER_CONCURRENT` | `1` | Max in-flight downloads per user (abuse guard). |
 | `DOWNLOAD_TIMEOUT_S` | `300` | Per-request timeout in seconds. |
-| `COOKIES` | — | Optional cookies.txt **content** (raw or base64, auto-detected), shared by both download engines; unlocks Instagram stories and login-gated posts, and bypasses YouTube's bot-check (see below). Preferred over `COOKIES_FILE` on PaaS hosts. |
-| `YOUTUBE_COOKIES` | — | Legacy-named alias for `COOKIES` (used when `COOKIES` is unset). |
-| `COOKIES_FILE` | — | Optional path to a cookies.txt on disk; used when no content var is set. |
-| `YOUTUBE_COOKIES_FILE` | — | Legacy alias for `COOKIES_FILE`. |
+| `YOUTUBE_COOKIES` | — | cookies.txt **content** (raw or base64, auto-detected) used **only for YouTube** — bypasses the bot-check (see below). |
+| `INSTAGRAM_COOKIES` | — | cookies.txt content used **only for Instagram**: stories, plus one automatic retry when a post is login-walled. Public reels/posts stay anonymous so the account isn't flagged. |
+| `COOKIES` | — | Generic cookies.txt content for platforms without a dedicated jar above. |
+| `*_COOKIES_FILE` | — | File-path variant of each of the three jars (`COOKIES_FILE`, `YOUTUBE_COOKIES_FILE`, `INSTAGRAM_COOKIES_FILE`); content vars win when both are set. |
 | `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, …). |
 
 ### YouTube "Sign in to confirm you're not a bot"
@@ -134,10 +134,12 @@ them with a bot-check. The bot handles this in two layers:
    with exponential backoff, cycling through the `android`, `ios`, and `tv` extraction
    clients, which bypass the bot-check in many cases without any credentials.
 2. **Cookies (reliable fallback)** — if retries aren't enough, export a `cookies.txt`
-   from a browser logged into YouTube (e.g. the "Get cookies.txt LOCALLY" extension)
-   and set `COOKIES` to its content — base64 is the safest form
+   from a browser logged into YouTube (e.g. the "Get cookies.txt LOCALLY" extension;
+   log in via a private window, export, then close it *without logging out*) and set
+   `YOUTUBE_COOKIES` to its content — base64 is the safest form
    (`base64 -w0 cookies.txt`; on macOS `base64 -i cookies.txt`). Alternatively mount
-   it as a file and set `COOKIES_FILE=data/cookies.txt`.
+   it as a file and set `YOUTUBE_COOKIES_FILE=data/youtube-cookies.txt`. These
+   cookies are sent only to YouTube, never to other platforms.
    Use a throwaway account; the cookies are a credential — keep them out of git (the
    default `.gitignore` already excludes `data/`).
 

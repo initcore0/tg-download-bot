@@ -29,11 +29,6 @@ DEST_SUBDIR = "gallery"
 
 _HTTP_TIMEOUT_S = 30
 
-# Optional Netscape-format cookies file (shared with yt-dlp), set once at startup.
-# Instagram stories — and increasingly regular Instagram/X posts — require a
-# logged-in session; without cookies those fail with AuthRequiredError.
-_COOKIES_FILE: Path | None = None
-
 
 class AuthRequiredError(ExtractionError):
     """The target content is behind a login (stories, private/restricted posts)."""
@@ -45,25 +40,14 @@ class AuthRequiredError(ExtractionError):
     )
 
 
-def configure(*, cookies_file: Path | None = None) -> None:
-    """Set process-wide options (called once from main)."""
-    global _COOKIES_FILE
-    if cookies_file is not None and Path(cookies_file).is_file():
-        _COOKIES_FILE = Path(cookies_file)
-        log.info("gallery-dl using cookies file: %s", _COOKIES_FILE)
-    else:
-        if cookies_file is not None:
-            log.warning("cookies file %s not found — gallery-dl runs without cookies", cookies_file)
-        _COOKIES_FILE = None
+def build_command(
+    url: str, dest: Path, *, max_items: int, cookies_file: Path | None = None
+) -> list[str]:
+    """gallery-dl argv: quiet, contained inside `dest`, no reads of user config.
 
-
-def cookies_configured() -> bool:
-    """True when a cookies file was configured and exists."""
-    return _COOKIES_FILE is not None
-
-
-def build_command(url: str, dest: Path, *, max_items: int) -> list[str]:
-    """gallery-dl argv: quiet, contained inside `dest`, no reads of user config."""
+    `cookies_file` is resolved per request by `tgdl.downloader.cookies` — the
+    Instagram jar is only attached for stories or an explicit login retry.
+    """
     args = [
         sys.executable,
         "-m",
@@ -82,8 +66,8 @@ def build_command(url: str, dest: Path, *, max_items: int) -> list[str]:
         "--range",
         f"1-{max_items}",
     ]
-    if _COOKIES_FILE is not None:
-        args += ["--cookies", str(_COOKIES_FILE)]
+    if cookies_file is not None:
+        args += ["--cookies", str(cookies_file)]
     args.append(url)
     return args
 
@@ -162,7 +146,9 @@ def collect_files(dest: Path) -> list[Path]:
     return sorted(files, key=lambda p: (p.stat().st_mtime, p.name))
 
 
-async def fetch(url: str, workdir: Path, *, max_items: int = 10) -> list[Path]:
+async def fetch(
+    url: str, workdir: Path, *, max_items: int = 10, cookies_file: Path | None = None
+) -> list[Path]:
     """Download the media behind `url` via gallery-dl into `workdir`/gallery.
 
     Returns the downloaded files in post order (images, and videos for stories).
@@ -171,7 +157,9 @@ async def fetch(url: str, workdir: Path, *, max_items: int = 10) -> list[Path]:
     dest = Path(workdir) / DEST_SUBDIR
     dest.mkdir(parents=True, exist_ok=True)
 
-    code, stderr = await _run(build_command(url, dest, max_items=max_items))
+    code, stderr = await _run(
+        build_command(url, dest, max_items=max_items, cookies_file=cookies_file)
+    )
     files = collect_files(dest)
 
     if not files:

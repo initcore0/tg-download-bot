@@ -45,7 +45,7 @@ def stub_extract(monkeypatch):
     """Install a fake ytdlp.extract that copies fixtures into the workdir."""
 
     def install(sources: list[Path], *, entry_overrides: list[dict] | None = None, error=None):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
             if error is not None:
                 raise error
             entries = []
@@ -175,7 +175,7 @@ class TestGalleries:
     async def test_playlist_items_requested_for_gallery_platforms(self, monkeypatch, jpg_file, tmp_path):
         seen = {}
 
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
             seen["playlist_items"] = playlist_items
             dst = Path(workdir) / "a.jpg"
             shutil.copy(jpg_file, dst)
@@ -192,7 +192,7 @@ class TestGalleries:
     async def test_partial_gallery_failure_still_returns_good_items(
         self, monkeypatch, jpg_file, tmp_path
     ):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
             good = Path(workdir) / "good.jpg"
             shutil.copy(jpg_file, good)
             bad = Path(workdir) / "bad.jpg"
@@ -211,7 +211,7 @@ class TestImageFallback:
     """yt-dlp finds no video -> the gallery-dl image engine takes over."""
 
     def _stub_fetch(self, monkeypatch, sources: list[Path] | None, *, error=None, calls=None):
-        async def _fetch(url, workdir, *, max_items=10):
+        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
             if calls is not None:
                 calls.append(url)
             if error is not None:
@@ -298,7 +298,7 @@ class TestImageFallback:
     ):
         stub_extract([], error=ExtractionError("no video"))
 
-        async def _fetch(url, workdir, *, max_items=10):
+        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
             dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
             dest.mkdir(parents=True, exist_ok=True)
             good = dest / "good.jpg"
@@ -327,7 +327,7 @@ class TestStories:
             raise AssertionError("ytdlp.extract must not run for cookie-less stories")
 
         monkeypatch.setattr(service.ytdlp, "extract", _extract)
-        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: False)
+        monkeypatch.setattr(service.cookies, "instagram_login", lambda: None)
         with pytest.raises(AuthRequiredError):
             await service.download_media(
                 "https://www.instagram.com/stories/someuser/123456/",
@@ -339,7 +339,9 @@ class TestStories:
     async def test_story_with_cookies_goes_through_normal_pipeline(
         self, stub_extract, monkeypatch, h264_mp4, tmp_path
     ):
-        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: True)
+        monkeypatch.setattr(
+            service.cookies, "instagram_login", lambda: tmp_path / "insta.txt"
+        )
         stub_extract([h264_mp4])
         (result,) = await service.download_media(
             "https://instagram.com/stories/someuser/123/", tmp_path, max_size_bytes=CAP
@@ -349,12 +351,124 @@ class TestStories:
     async def test_non_story_instagram_needs_no_cookies(
         self, stub_extract, monkeypatch, h264_mp4, tmp_path
     ):
-        monkeypatch.setattr(service.gallerydl, "cookies_configured", lambda: False)
+        monkeypatch.setattr(service.cookies, "instagram_login", lambda: None)
         stub_extract([h264_mp4])
         (result,) = await service.download_media(
             "https://instagram.com/reel/abc/", tmp_path, max_size_bytes=CAP
         )
         assert result.kind == "video"
+
+
+class TestCookieRouting:
+    """Each platform only ever sees its own cookie jar (service-level wiring)."""
+
+    @pytest.fixture
+    def jars(self, tmp_path):
+        from types import SimpleNamespace
+
+        generic = tmp_path / "generic.txt"
+        youtube = tmp_path / "youtube.txt"
+        instagram = tmp_path / "instagram.txt"
+        for f in (generic, youtube, instagram):
+            f.write_text("# Netscape HTTP Cookie File\n")
+        service.cookies.configure(generic=generic, youtube=youtube, instagram=instagram)
+        yield SimpleNamespace(generic=generic, youtube=youtube, instagram=instagram)
+        service.cookies.configure()
+
+    @pytest.fixture
+    def spy_extract(self, monkeypatch, h264_mp4):
+        seen = {}
+
+        async def _extract(
+            url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None
+        ):
+            seen["cookies_file"] = cookies_file
+            dst = Path(workdir) / "a.mp4"
+            shutil.copy(h264_mp4, dst)
+            return [fake_entry(dst)]
+
+        monkeypatch.setattr(service.ytdlp, "extract", _extract)
+        return seen
+
+    async def test_youtube_gets_only_the_youtube_jar(self, jars, spy_extract, tmp_path):
+        await service.download_media(
+            "https://youtube.com/shorts/abc", tmp_path, max_size_bytes=CAP
+        )
+        assert spy_extract["cookies_file"] == jars.youtube
+
+    async def test_instagram_post_is_fetched_anonymously(self, jars, spy_extract, tmp_path):
+        # Public reels/posts must not carry the session — that's what flags accounts.
+        await service.download_media(
+            "https://instagram.com/reel/abc/", tmp_path, max_size_bytes=CAP
+        )
+        assert spy_extract["cookies_file"] is None
+
+    async def test_instagram_story_gets_the_instagram_jar(self, jars, spy_extract, tmp_path):
+        await service.download_media(
+            "https://instagram.com/stories/u/1/", tmp_path, max_size_bytes=CAP
+        )
+        assert spy_extract["cookies_file"] == jars.instagram
+
+    async def test_other_platforms_get_the_generic_jar(self, jars, spy_extract, tmp_path):
+        await service.download_media(
+            "https://x.com/u/status/1", tmp_path, max_size_bytes=CAP
+        )
+        assert spy_extract["cookies_file"] == jars.generic
+
+    async def test_login_wall_triggers_one_retry_with_session(
+        self, jars, monkeypatch, jpg_file, tmp_path
+    ):
+        from tgdl.downloader.gallerydl import AuthRequiredError
+
+        async def _extract(*args, **kwargs):
+            raise ExtractionError("There is no video in this post")
+
+        fetch_jars = []
+
+        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
+            fetch_jars.append(cookies_file)
+            if cookies_file is None:
+                raise AuthRequiredError("login required")
+            dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
+            dest.mkdir(parents=True, exist_ok=True)
+            out = dest / "a.jpg"
+            shutil.copy(jpg_file, out)
+            return [out]
+
+        monkeypatch.setattr(service.ytdlp, "extract", _extract)
+        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+
+        (result,) = await service.download_media(
+            "https://instagram.com/p/walled/", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "image"
+        # Anonymous first; the session only after the login wall.
+        assert fetch_jars == [None, jars.instagram]
+
+    async def test_login_wall_without_session_propagates(
+        self, monkeypatch, tmp_path
+    ):
+        from tgdl.downloader.gallerydl import AuthRequiredError
+
+        service.cookies.configure()  # no jars at all
+
+        async def _extract(*args, **kwargs):
+            raise ExtractionError("There is no video in this post")
+
+        calls = []
+
+        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
+            calls.append(cookies_file)
+            raise AuthRequiredError("login required")
+
+        monkeypatch.setattr(service.ytdlp, "extract", _extract)
+        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+
+        with pytest.raises(AuthRequiredError):
+            await service.download_media(
+                "https://instagram.com/p/walled/", tmp_path, max_size_bytes=CAP
+            )
+        assert calls == [None]  # no session to retry with -> exactly one attempt
 
 
 class TestSizeCap:
@@ -485,7 +599,7 @@ class TestErrorMapping:
             await service.download_media("https://example.com/a", tmp_path, max_size_bytes=CAP)
 
     async def test_no_file_produced_raises_extraction_error(self, monkeypatch, tmp_path):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
             return [{"id": "x", "title": "t"}]  # no requested_downloads / missing file
 
         monkeypatch.setattr(service.ytdlp, "extract", _extract)
@@ -493,7 +607,7 @@ class TestErrorMapping:
             await service.download_media("https://example.com/a", tmp_path, max_size_bytes=CAP)
 
     async def test_corrupt_media_raises_transcode_error(self, monkeypatch, tmp_path):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
             bad = Path(workdir) / "bad.mp4"
             bad.write_bytes(b"not real media")
             return [fake_entry(bad)]

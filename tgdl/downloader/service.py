@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from tgdl.downloader import gallerydl, ytdlp
+from tgdl.downloader import cookies, gallerydl, ytdlp
 from tgdl.downloader import transcode as tc
 from tgdl.downloader.models import (
     DownloadError,
@@ -100,7 +100,8 @@ async def _run_pipeline(
 
     # Instagram stories are always login-gated: fail fast with a clear message
     # instead of burning both engines' retries on a guaranteed auth wall.
-    if _is_instagram_story(url, platform) and not gallerydl.cookies_configured():
+    story = _is_instagram_story(url, platform)
+    if story and cookies.instagram_login() is None:
         raise gallerydl.AuthRequiredError(f"instagram story without cookies: {url}")
 
     try:
@@ -109,6 +110,7 @@ async def _run_pipeline(
             workdir,
             max_height=max_height,
             playlist_items=playlist_items,
+            cookies_file=cookies.resolve(platform, story=story),
         )
     except (UnsupportedUrlError, ExtractionError) as exc:
         # yt-dlp only extracts videos. Image-only posts (Instagram photos, image
@@ -118,6 +120,7 @@ async def _run_pipeline(
             url,
             workdir,
             platform=platform,
+            story=story,
             max_size_bytes=max_size_bytes,
             max_height=max_height,
             original=exc,
@@ -172,18 +175,34 @@ async def _image_fallback(
     workdir: Path,
     *,
     platform: str,
+    story: bool,
     max_size_bytes: int,
     max_height: int,
     original: DownloadError,
 ) -> list[MediaResult]:
     """Fetch a post's images (and story videos) via gallery-dl after yt-dlp failed.
 
-    On success the yt-dlp failure is forgotten. If gallery-dl reports a login wall,
-    that (more actionable) error wins; any other fallback failure re-raises the
-    original yt-dlp error so the user message reflects the primary engine.
+    On success the yt-dlp failure is forgotten. A login wall on an *anonymous*
+    attempt gets one retry with the platform's login jar (minimal-exposure policy:
+    the session is used only when the content demands it); if that isn't possible
+    or fails, the AuthRequiredError (more actionable) wins. Any other fallback
+    failure re-raises the original yt-dlp error so the user message reflects the
+    primary engine.
     """
+    jar = cookies.resolve(platform, story=story)
     try:
-        paths = await gallerydl.fetch(url, workdir, max_items=MAX_GALLERY_ITEMS)
+        try:
+            paths = await gallerydl.fetch(
+                url, workdir, max_items=MAX_GALLERY_ITEMS, cookies_file=jar
+            )
+        except gallerydl.AuthRequiredError:
+            login_jar = cookies.resolve(platform, story=story, use_login=True)
+            if login_jar is None or login_jar == jar:
+                raise
+            log.info("login wall for %s — retrying once with the %s session", url, platform)
+            paths = await gallerydl.fetch(
+                url, workdir, max_items=MAX_GALLERY_ITEMS, cookies_file=login_jar
+            )
     except gallerydl.AuthRequiredError:
         raise
     except DownloadError as exc:

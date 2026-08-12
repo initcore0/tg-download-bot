@@ -93,23 +93,6 @@ _YT_CLIENT_FALLBACKS: tuple[tuple[str, ...], ...] = (
 _MAX_ATTEMPTS = 4
 _BACKOFF_BASE_S = 1.5
 
-# Optional cookies file (Netscape format), set once at startup. On datacenter IPs
-# this is the reliable way past YouTube's "confirm you're not a bot" gate.
-_COOKIES_FILE: Path | None = None
-
-
-def configure(*, cookies_file: Path | None = None) -> None:
-    """Set process-wide extraction options (called once from main)."""
-    global _COOKIES_FILE
-    if cookies_file is not None and Path(cookies_file).is_file():
-        _COOKIES_FILE = Path(cookies_file)
-        log.info("using YouTube cookies file: %s", _COOKIES_FILE)
-    elif cookies_file is not None:
-        log.warning("cookies file %s not found — continuing without cookies", cookies_file)
-        _COOKIES_FILE = None
-    else:
-        _COOKIES_FILE = None
-
 
 def build_format_selector(max_height: int) -> str:
     """yt-dlp format string, best (cheapest to serve) option first."""
@@ -127,11 +110,14 @@ def build_options(
     max_height: int,
     playlist_items: str | None = None,
     youtube_clients: tuple[str, ...] = (),
+    cookies_file: Path | None = None,
 ) -> dict[str, Any]:
     """yt-dlp options: quiet, contained inside `workdir`, no writes elsewhere.
 
     `youtube_clients`, when non-empty, forces yt-dlp's YouTube player-client order —
     used by the retry loop to dodge client-specific throttling/bot-checks.
+    `cookies_file` is resolved per request by `tgdl.downloader.cookies` so each
+    platform only ever sees its own jar.
     """
     opts: dict[str, Any] = {
         "format": build_format_selector(max_height),
@@ -162,8 +148,8 @@ def build_options(
         opts["noplaylist"] = False
     if youtube_clients:
         opts["extractor_args"] = {"youtube": {"player_client": list(youtube_clients)}}
-    if _COOKIES_FILE is not None:
-        opts["cookiefile"] = str(_COOKIES_FILE)
+    if cookies_file is not None:
+        opts["cookiefile"] = str(cookies_file)
     return opts
 
 
@@ -241,6 +227,7 @@ async def extract(
     playlist_items: str | None = None,
     download: bool = True,
     max_attempts: int = _MAX_ATTEMPTS,
+    cookies_file: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Download `url` into `workdir`; return one info dict per downloaded item.
 
@@ -257,6 +244,7 @@ async def extract(
             max_height=max_height,
             playlist_items=playlist_items,
             youtube_clients=clients,
+            cookies_file=cookies_file,
         )
         try:
             info = await asyncio.to_thread(_extract_sync, url, opts, download=download)
