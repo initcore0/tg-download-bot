@@ -1,8 +1,9 @@
 # tg-download-bot
 
 Telegram bot: send it a media link (YouTube/TikTok/Instagram/X/Twitch/Pinterest/...),
-it downloads via yt-dlp, remuxes/transcodes to Telegram-friendly MP4 (≤720p, ≤48MB),
-and sends it back as plain media. Read ARCHITECTURE.md before changing anything.
+it downloads via yt-dlp (gallery-dl fallback for image posts/carousels/stories),
+remuxes/transcodes video to Telegram-friendly MP4 (≤720p, ≤48MB), and sends it back
+as plain media. Read ARCHITECTURE.md before changing anything.
 
 ## Commands
 - Install: `uv sync`

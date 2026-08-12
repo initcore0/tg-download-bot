@@ -16,7 +16,7 @@ from sqlalchemy.exc import OperationalError
 
 from tgdl.bot import handlers, runtime
 from tgdl.config import Settings, load_settings
-from tgdl.downloader import transcode, ytdlp
+from tgdl.downloader import gallerydl, transcode, ytdlp
 from tgdl.storage import repo
 
 log = logging.getLogger("tgdl")
@@ -50,7 +50,8 @@ async def run(settings: Settings) -> None:
             "for remuxing and transcoding. Install ffmpeg (the Docker image already "
             "includes it) and try again."
         )
-    ytdlp.configure(cookies_file=settings.youtube_cookies_file)
+    ytdlp.configure(cookies_file=settings.effective_cookies_file)
+    gallerydl.configure(cookies_file=settings.effective_cookies_file)
 
     try:
         await repo.init_db(settings.database_path)

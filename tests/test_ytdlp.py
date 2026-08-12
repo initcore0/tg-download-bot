@@ -58,6 +58,21 @@ class TestClassify:
     def test_transient(self, message):
         assert isinstance(ytdlp._classify(Exception(message)), TransientExtractionError)
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "There is no video in this post",
+            "ERROR: No video could be found in this tweet",
+            "ERROR: [generic] example: No video formats found!",
+        ],
+    )
+    def test_no_video_is_permanent_not_transient(self, message):
+        # Image-only posts must fail fast so the gallery-dl fallback runs
+        # immediately instead of after ~15s of pointless retries.
+        exc = ytdlp._classify(Exception(message))
+        assert isinstance(exc, ExtractionError)
+        assert not isinstance(exc, TransientExtractionError)
+
 
 class TestRetry:
     async def test_retries_transient_then_succeeds(self, monkeypatch, tmp_path):

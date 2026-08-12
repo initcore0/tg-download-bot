@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     # relies on player-client fallback (android/ios/tv), which covers many cases.
     youtube_cookies_file: Path | None = None
 
+    # Optional generic Netscape-format cookies file shared by both download engines
+    # (yt-dlp and gallery-dl). Needed for login-gated content such as Instagram
+    # stories. Falls back to `youtube_cookies_file` when unset, so one exported
+    # browser cookies file (which may hold cookies for many sites) covers everything.
+    cookies_file: Path | None = None
+
+    @property
+    def effective_cookies_file(self) -> Path | None:
+        return self.cookies_file or self.youtube_cookies_file
+
     # Max in-flight downloads a single user can hold at once (abuse guard).
     max_per_user_concurrent: int = 1
 

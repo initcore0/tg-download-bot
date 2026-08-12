@@ -104,6 +104,17 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "I downloaded the media but couldn't convert it to a Telegram-friendly format.",
         "ru": "Я скачал медиа, но не смог преобразовать его в подходящий для Telegram формат.",
     },
+    "error.login_required": {
+        "en": (
+            "That content is only visible to logged-in accounts (stories and some "
+            "posts). The bot isn't signed in to that service, so it can't fetch it."
+        ),
+        "ru": (
+            "Этот контент доступен только авторизованным аккаунтам (истории и "
+            "некоторые посты). Бот не авторизован в этом сервисе и не может его "
+            "получить."
+        ),
+    },
     "error.timeout": {
         "en": "That download took too long and was cancelled. Please try a shorter video.",
         "ru": "Скачивание заняло слишком много времени и было отменено. Попробуй видео покороче.",

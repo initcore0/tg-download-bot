@@ -10,9 +10,10 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from tgdl.downloader import gallerydl, ytdlp
 from tgdl.downloader import transcode as tc
-from tgdl.downloader import ytdlp
 from tgdl.downloader.models import (
     DownloadError,
     DownloadTimeoutError,
@@ -25,8 +26,9 @@ from tgdl.downloader.urls import detect_platform, is_safe_public_url
 
 log = logging.getLogger(__name__)
 
-# Platforms whose posts are frequently image carousels rather than single videos.
-GALLERY_PLATFORMS = {"instagram", "pinterest"}
+# Platforms whose posts are frequently multi-item (image carousels, multi-image
+# tweets) rather than single videos.
+GALLERY_PLATFORMS = {"instagram", "pinterest", "twitter"}
 MAX_GALLERY_ITEMS = 10
 RETRY_HEIGHT = 480
 
@@ -96,12 +98,30 @@ async def _run_pipeline(
     platform = detect_platform(url)
     playlist_items = f"1-{MAX_GALLERY_ITEMS}" if platform in GALLERY_PLATFORMS else None
 
-    entries = await ytdlp.extract(
-        url,
-        workdir,
-        max_height=max_height,
-        playlist_items=playlist_items,
-    )
+    # Instagram stories are always login-gated: fail fast with a clear message
+    # instead of burning both engines' retries on a guaranteed auth wall.
+    if _is_instagram_story(url, platform) and not gallerydl.cookies_configured():
+        raise gallerydl.AuthRequiredError(f"instagram story without cookies: {url}")
+
+    try:
+        entries = await ytdlp.extract(
+            url,
+            workdir,
+            max_height=max_height,
+            playlist_items=playlist_items,
+        )
+    except (UnsupportedUrlError, ExtractionError) as exc:
+        # yt-dlp only extracts videos. Image-only posts (Instagram photos, image
+        # tweets, Pinterest pins) and story images land here — retry the URL
+        # through the gallery-dl image engine before giving up.
+        return await _image_fallback(
+            url,
+            workdir,
+            platform=platform,
+            max_size_bytes=max_size_bytes,
+            max_height=max_height,
+            original=exc,
+        )
 
     results: list[MediaResult] = []
     errors: list[str] = []
@@ -136,6 +156,70 @@ async def _run_pipeline(
     return results
 
 
+def _is_instagram_story(url: str, platform: str) -> bool:
+    """True for instagram.com/stories/... links (single story or a user's stories)."""
+    if platform != "instagram":
+        return False
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return False
+    return path.strip("/").startswith("stories/")
+
+
+async def _image_fallback(
+    url: str,
+    workdir: Path,
+    *,
+    platform: str,
+    max_size_bytes: int,
+    max_height: int,
+    original: DownloadError,
+) -> list[MediaResult]:
+    """Fetch a post's images (and story videos) via gallery-dl after yt-dlp failed.
+
+    On success the yt-dlp failure is forgotten. If gallery-dl reports a login wall,
+    that (more actionable) error wins; any other fallback failure re-raises the
+    original yt-dlp error so the user message reflects the primary engine.
+    """
+    try:
+        paths = await gallerydl.fetch(url, workdir, max_items=MAX_GALLERY_ITEMS)
+    except gallerydl.AuthRequiredError:
+        raise
+    except DownloadError as exc:
+        log.info("image fallback for %s also failed: %s", url, exc)
+        raise original from exc
+
+    log.info("image fallback produced %d file(s) for %s", len(paths), url)
+    results: list[MediaResult] = []
+    errors: list[str] = []
+    for path in paths:
+        try:
+            results.append(
+                await _process_file(
+                    path,
+                    title=None,
+                    source_url=url,
+                    platform=platform,
+                    max_size_bytes=max_size_bytes,
+                    max_height=max_height,
+                )
+            )
+        except DownloadError as exc:
+            errors.append(f"{path.name}: {exc.detail or exc}")
+            if len(paths) == 1:
+                raise
+
+    if not results:
+        raise ExtractionError(
+            "no media could be produced from that link"
+            + (f" ({'; '.join(errors)})" if errors else "")
+        )
+    if errors:
+        log.warning("partial image-fallback download for %s: %s", url, "; ".join(errors))
+    return results
+
+
 async def _process_entry(
     entry: dict[str, Any],
     path: Path,
@@ -145,11 +229,30 @@ async def _process_entry(
     max_size_bytes: int,
     max_height: int,
 ) -> MediaResult:
-    """Turn one downloaded file into a Telegram-ready MediaResult."""
+    """Turn one downloaded yt-dlp entry into a Telegram-ready MediaResult."""
     title = entry.get("title") or entry.get("description") or None
     if isinstance(title, str):
         title = title.strip()[:200] or None
+    return await _process_file(
+        path,
+        title=title,
+        source_url=source_url,
+        platform=platform,
+        max_size_bytes=max_size_bytes,
+        max_height=max_height,
+    )
 
+
+async def _process_file(
+    path: Path,
+    *,
+    title: str | None,
+    source_url: str,
+    platform: str,
+    max_size_bytes: int,
+    max_height: int,
+) -> MediaResult:
+    """Turn one downloaded file into a Telegram-ready MediaResult."""
     source_ext = path.suffix.lower()
     info = await tc.probe(path)
 

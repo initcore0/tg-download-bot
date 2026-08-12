@@ -36,6 +36,7 @@ dedup by file_id (schema-ready only), rate limiting beyond a concurrency cap, ad
 | Language       | Python 3.12, fully async                 | yt-dlp is Python; best ecosystem fit |
 | Bot framework  | aiogram 3.x (long polling)               | Modern async, no webhook/infra needed |
 | Extraction     | yt-dlp (Python API, in thread executor)  | Supports all required platforms |
+| Image fallback | gallery-dl (async subprocess)            | Image posts/stories yt-dlp can't extract |
 | Transcoding    | ffmpeg subprocess (async)                | Remux-first; libx264 veryfast fallback |
 | DB             | SQLite via SQLAlchemy 2 async + aiosqlite| Zero infra; trivial to move to Postgres |
 | Config         | pydantic-settings, `.env`                | Typed env config |
@@ -121,6 +122,24 @@ yt-dlp options: `quiet`, `noplaylist=True`, `playlist_items="1-10"` only for ima
 galleries, no cache writes outside workdir. yt-dlp's blocking calls run via
 `asyncio.to_thread`. Whole operation wrapped in `asyncio.timeout(timeout_s)` (default 300s).
 
+### 5.5 Image fallback engine (`tgdl/downloader/gallerydl.py`)
+
+yt-dlp only extracts videos. When it reports a permanent failure — including the
+"there is no video in this post" family, which `ytdlp._classify` maps to a permanent
+`ExtractionError` precisely so no retry time is wasted — the service retries the URL
+through **gallery-dl** (async subprocess, output confined to `workdir/gallery/`,
+`--config-ignore`, `--range 1-10`). This covers Instagram photo posts/carousels, image
+tweets, Pinterest pins, story images, and other image hosts. Downloaded files go through
+the same per-file pipeline (`_process_file`): images pass through (webp→jpg), story
+*videos* take the normal remux/transcode path. If the fallback also fails, the original
+yt-dlp error is re-raised — unless gallery-dl hit a login wall, in which case the more
+actionable `AuthRequiredError` ("error.login_required") wins.
+
+**Stories.** `instagram.com/stories/...` is always login-gated: with no cookies file
+configured the service fails fast with `AuthRequiredError` before either engine runs.
+A single Netscape `cookies.txt` (env `COOKIES_FILE`, legacy alias
+`YOUTUBE_COOKIES_FILE`) is shared by both engines.
+
 ## 6. Storage / audit (`tgdl/storage/`)
 
 SQLite at `DATABASE_PATH` (default `data/tgdl.db`), WAL mode. Table created on startup
@@ -181,6 +200,9 @@ MAX_HEIGHT           default 720
 MAX_CONCURRENT_DOWNLOADS default 3
 DOWNLOAD_TIMEOUT_S   default 300
 LOG_LEVEL            default INFO
+COOKIES_FILE         optional Netscape cookies.txt shared by yt-dlp + gallery-dl
+                     (YouTube bot-check, Instagram stories/login-gated posts);
+                     legacy alias YOUTUBE_COOKIES_FILE
 ```
 
 ## 9. Module ownership & boundaries (for parallel build agents)

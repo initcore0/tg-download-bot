@@ -9,6 +9,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
     "pydantic-settings>=2.4",
+    "gallery-dl>=1.29",
 ]
 
 [project.scripts]
