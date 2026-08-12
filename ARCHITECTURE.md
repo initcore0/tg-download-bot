@@ -52,9 +52,10 @@ Telegram update
        1. Extract URL(s) from message text/entities (first supported URL wins).
           Private chat: any URL. Group/channel: only when @botusername is mentioned.
        2. Audit: create_request — anonymous, no user/chat identifiers  (storage/repo.py)
-       3. React immediately with the native chat-action status ("sending a video…"),
-          kept alive via ChatActionSender for the whole download (actions expire ~5s);
-          switched to "sending a photo…" during the upload phase when results are images.
+       3. React immediately with a neutral "typing…" chat action, kept alive via
+          ChatActionSender for the whole download (actions expire ~5s). Only after the
+          download succeeds — when we know the link was downloadable and what it holds —
+          does the upload phase switch to "sending a photo…"/"sending a video…".
        4. Acquire global semaphore (MAX_CONCURRENT_DOWNLOADS, default 3).
        5. downloader.service.download_media(url, workdir) → list[MediaResult]
        6. Send media (sendVideo / sendPhoto / sendAnimation / sendMediaGroup),

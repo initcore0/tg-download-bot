@@ -13,6 +13,7 @@ from tgdl.bot import handlers, runtime
 from tgdl.config import Settings
 from tgdl.downloader.models import (
     DownloadError,
+    ExtractionError,
     MediaResult,
     MediaTooLargeError,
     UnsupportedUrlError,
@@ -502,16 +503,30 @@ class TestSuccessFlow:
         msg.reply.assert_not_awaited()
         msg.bot.send_chat_action.assert_awaited()
 
-    async def test_upload_chat_action_sent(
+    async def test_initial_chat_action_is_neutral_typing(
         self, settings, tmp_path, mock_repo, mock_download
     ):
+        # Until the download succeeds we don't know whether the link is even
+        # downloadable, or whether it's a video or photos — so the immediate
+        # feedback must be a neutral "typing…", never "sending a video…".
         mock_download.return_value = [make_media(tmp_path)]
         msg = make_message("https://youtu.be/abc")
 
         await handlers.handle_private(msg, settings)
 
         msg.bot.send_chat_action.assert_awaited_once()
-        assert msg.bot.send_chat_action.await_args.args[1] == "upload_video"
+        assert msg.bot.send_chat_action.await_args.args[1] == "typing"
+
+    async def test_failed_download_never_claims_media_action(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_download.side_effect = ExtractionError("boom")
+        msg = make_message("https://instagram.com/p/x")
+
+        await handlers.handle_private(msg, settings)
+
+        actions = [c.args[1] for c in msg.bot.send_chat_action.await_args_list]
+        assert all(a == "typing" for a in actions)
 
     async def test_request_recorded_anonymously(
         self, settings, tmp_path, mock_repo, mock_download

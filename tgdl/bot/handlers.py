@@ -276,10 +276,13 @@ async def _run_download(
     """The download+send+audit cycle, run while holding a user slot. Never raises."""
     request_id = await _audit_create_request(message, url)
 
-    # Immediate feedback ("sending a video…") even while queued on the semaphore;
-    # ChatActionSender then keeps the status alive (actions expire after ~5s).
+    # Immediate feedback even while queued on the semaphore — but a *neutral*
+    # "typing…" only: we don't yet know whether the link is downloadable at all,
+    # or whether it holds a video or photos. Claiming "sending a video…" and then
+    # failing (or sending a photo) reads as a broken promise. The media-specific
+    # action is shown after the download succeeds, in the upload phase below.
     try:
-        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     except Exception:
         log.debug("send_chat_action failed", exc_info=True)
 
@@ -290,7 +293,7 @@ async def _run_download(
             base.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(prefix="req-", dir=base))
 
-            async with ChatActionSender.upload_video(
+            async with ChatActionSender.typing(
                 bot=message.bot, chat_id=message.chat.id
             ):
                 results = await service.download_media(
@@ -304,7 +307,8 @@ async def _run_download(
             if not results:
                 raise DownloadError("downloader returned no results")
 
-            # Upload phase: show the action matching what we're actually sending.
+            # Upload phase: the download succeeded and we know the media kind, so
+            # now (and only now) show the matching "sending a photo/video…" action.
             action_sender = (
                 ChatActionSender.upload_photo
                 if all(r.kind == "image" for r in results)
