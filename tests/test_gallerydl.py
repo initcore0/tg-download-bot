@@ -18,14 +18,6 @@ from tgdl.downloader.models import (
 )
 
 
-@pytest.fixture(autouse=True)
-def no_cookies():
-    """Each test starts without a configured cookies file."""
-    gallerydl.configure(cookies_file=None)
-    yield
-    gallerydl.configure(cookies_file=None)
-
-
 class TestBuildCommand:
     def test_basic_shape(self, tmp_path):
         args = gallerydl.build_command("https://x.com/u/status/1", tmp_path, max_items=10)
@@ -41,17 +33,17 @@ class TestBuildCommand:
         cache = args[args.index("--cache-file") + 1]
         assert str(tmp_path) in cache
 
-    def test_cookies_flag_when_configured(self, tmp_path):
+    def test_cookies_flag_when_passed(self, tmp_path):
         cookies = tmp_path / "cookies.txt"
         cookies.write_text("# Netscape HTTP Cookie File\n")
-        gallerydl.configure(cookies_file=cookies)
-        assert gallerydl.cookies_configured()
-        args = gallerydl.build_command("https://u.rl/x", tmp_path, max_items=10)
+        args = gallerydl.build_command(
+            "https://u.rl/x", tmp_path, max_items=10, cookies_file=cookies
+        )
         assert args[args.index("--cookies") + 1] == str(cookies)
 
-    def test_missing_cookies_file_is_ignored(self, tmp_path):
-        gallerydl.configure(cookies_file=tmp_path / "nope.txt")
-        assert not gallerydl.cookies_configured()
+    def test_no_cookies_flag_by_default(self, tmp_path):
+        args = gallerydl.build_command("https://u.rl/x", tmp_path, max_items=10)
+        assert "--cookies" not in args
 
 
 class TestClassifyFailure:

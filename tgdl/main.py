@@ -21,7 +21,7 @@ from sqlalchemy.exc import OperationalError
 
 from tgdl.bot import handlers, runtime
 from tgdl.config import Settings, load_settings
-from tgdl.downloader import gallerydl, transcode, ytdlp
+from tgdl.downloader import cookies, transcode
 from tgdl.storage import repo
 
 log = logging.getLogger("tgdl")
@@ -51,21 +51,40 @@ def _decode_cookies_content(content: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
-def _materialize_cookies(settings: Settings) -> tuple[Path | None, bool]:
-    """Resolve the cookies source into a file path for the download engines.
+def _materialize_jar(
+    content: str, file: Path | None, label: str, temp_files: list[Path]
+) -> Path | None:
+    """Resolve one cookie jar: env-var content (raw/base64) wins over a file path.
 
-    Env-var content wins over the *_FILE path settings; it is written to a
-    0600 temp file (never the persistent data volume — the content is a
-    credential). Returns (path, is_temporary) so the caller can clean up.
+    Content is written to a 0600 temp file (never the persistent data volume —
+    it's a credential); the path is appended to `temp_files` for cleanup.
     """
-    content = settings.cookies_content
+    content = (content or "").strip()
     if not content:
-        return settings.effective_cookies_file, False
-    fd, name = tempfile.mkstemp(prefix="tgdl-cookies-", suffix=".txt")  # 0600 by default
+        return file
+    fd, name = tempfile.mkstemp(prefix=f"tgdl-cookies-{label}-", suffix=".txt")  # 0600 by default
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(_decode_cookies_content(content))
-    log.info("cookies loaded from environment variable into a private temp file")
-    return Path(name), True
+    log.info("%s cookies loaded from environment variable into a private temp file", label)
+    temp_files.append(Path(name))
+    return Path(name)
+
+
+def _materialize_cookies(settings: Settings) -> tuple[dict[str, Path | None], list[Path]]:
+    """Resolve all three cookie jars; returns ({name: path}, temp files to clean up)."""
+    temp_files: list[Path] = []
+    jars = {
+        "generic": _materialize_jar(
+            settings.cookies, settings.cookies_file, "generic", temp_files
+        ),
+        "youtube": _materialize_jar(
+            settings.youtube_cookies, settings.youtube_cookies_file, "youtube", temp_files
+        ),
+        "instagram": _materialize_jar(
+            settings.instagram_cookies, settings.instagram_cookies_file, "instagram", temp_files
+        ),
+    }
+    return jars, temp_files
 
 
 async def _resolve_username(bot: Bot) -> str | None:
@@ -93,9 +112,10 @@ async def run(settings: Settings) -> None:
             "for remuxing and transcoding. Install ffmpeg (the Docker image already "
             "includes it) and try again."
         )
-    cookies_file, cookies_is_temp = _materialize_cookies(settings)
-    ytdlp.configure(cookies_file=cookies_file)
-    gallerydl.configure(cookies_file=cookies_file)
+    jars, cookie_temp_files = _materialize_cookies(settings)
+    cookies.configure(
+        generic=jars["generic"], youtube=jars["youtube"], instagram=jars["instagram"]
+    )
 
     try:
         await repo.init_db(settings.database_path)
@@ -147,11 +167,11 @@ async def run(settings: Settings) -> None:
             await bot.session.close()
         except Exception:
             log.exception("error closing bot session")
-        if cookies_is_temp and cookies_file is not None:
+        for temp_cookie in cookie_temp_files:
             try:
-                cookies_file.unlink(missing_ok=True)
+                temp_cookie.unlink(missing_ok=True)
             except OSError:
-                log.warning("could not remove temp cookies file %s", cookies_file)
+                log.warning("could not remove temp cookies file %s", temp_cookie)
 
 
 async def _healthcheck(settings: Settings) -> int:

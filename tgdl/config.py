@@ -16,33 +16,24 @@ class Settings(BaseSettings):
     download_timeout_s: int = 300
     log_level: str = "INFO"
 
-    # Optional Netscape-format cookies file. On datacenter IPs (most VPS/Coolify
-    # hosts) YouTube demands "Sign in to confirm you're not a bot"; a cookies file
-    # exported from a logged-in browser is the reliable fix. Left empty, the bot
-    # relies on player-client fallback (android/ios/tv), which covers many cases.
-    youtube_cookies_file: Path | None = None
-
-    # Optional generic Netscape-format cookies file shared by both download engines
-    # (yt-dlp and gallery-dl). Needed for login-gated content such as Instagram
-    # stories. Falls back to `youtube_cookies_file` when unset, so one exported
-    # browser cookies file (which may hold cookies for many sites) covers everything.
-    cookies_file: Path | None = None
-
-    # Cookie *content* via environment — preferred on PaaS hosts (Coolify, etc.)
-    # where mounting a file is awkward. The value is the Netscape cookies.txt text
-    # itself, or its base64 encoding (auto-detected); it is materialized to a
-    # private temp file at startup and wins over the *_file path settings.
-    # COOKIES covers both engines; YOUTUBE_COOKIES is the legacy-named alias.
+    # Netscape-format cookies, kept in per-platform jars so each site only ever
+    # receives its own credentials (see tgdl/downloader/cookies.py for the routing
+    # policy — notably, non-story Instagram requests stay anonymous by default).
+    #
+    # Each jar can be given either as *content* via env var (the cookies.txt text
+    # or its base64 encoding, auto-detected — preferred on PaaS hosts like Coolify;
+    # materialized to a private temp file at startup) or as a *file path*. Content
+    # wins over the path when both are set.
+    #   COOKIES / COOKIES_FILE               generic jar (any platform without its own)
+    #   YOUTUBE_COOKIES / YOUTUBE_COOKIES_FILE    used only for YouTube
+    #   INSTAGRAM_COOKIES / INSTAGRAM_COOKIES_FILE used only for Instagram
+    #     (stories, plus one retry when a post turns out to be login-walled)
     cookies: str = ""
+    cookies_file: Path | None = None
     youtube_cookies: str = ""
-
-    @property
-    def cookies_content(self) -> str:
-        return (self.cookies or self.youtube_cookies).strip()
-
-    @property
-    def effective_cookies_file(self) -> Path | None:
-        return self.cookies_file or self.youtube_cookies_file
+    youtube_cookies_file: Path | None = None
+    instagram_cookies: str = ""
+    instagram_cookies_file: Path | None = None
 
     # Max in-flight downloads a single user can hold at once (abuse guard).
     max_per_user_concurrent: int = 1
