@@ -15,6 +15,7 @@ from tgdl.downloader.models import (
     TransientExtractionError,
     UnsupportedUrlError,
 )
+from tgdl.downloader.urls import detect_platform
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,14 @@ _YT_CLIENT_FALLBACKS: tuple[tuple[str, ...], ...] = (
     ("ios",),
     ("tv",),
 )
+
+# First retry attempt (0-based) that drops cookies on YouTube. A logged-in session
+# makes YouTube serve web clients SABR-only streams (no classic formats -> yt-dlp
+# reports "Requested format is not available"), and yt-dlp skips the alternate
+# player clients that don't support cookies — so with cookies attached, every
+# fallback attempt degenerates into the same doomed configuration. Dropping the
+# jar for the later rungs restores the anonymous android/ios/tv coverage.
+_YT_ANONYMOUS_FROM_ATTEMPT = 2
 
 _MAX_ATTEMPTS = 4
 _BACKOFF_BASE_S = 1.5
@@ -236,15 +245,25 @@ async def extract(
     failures (UnsupportedUrlError / non-transient ExtractionError) raise immediately.
     Never raises a bare exception.
     """
+    is_youtube = detect_platform(url) == "youtube"
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         clients = _YT_CLIENT_FALLBACKS[min(attempt, len(_YT_CLIENT_FALLBACKS) - 1)]
+        attempt_cookies = cookies_file
+        if is_youtube and cookies_file is not None and attempt >= _YT_ANONYMOUS_FROM_ATTEMPT:
+            attempt_cookies = None
+            log.info(
+                "attempt %d for %s: retrying anonymously (cookies limit YouTube "
+                "to SABR-only web formats)",
+                attempt + 1,
+                url,
+            )
         opts = build_options(
             workdir,
             max_height=max_height,
             playlist_items=playlist_items,
             youtube_clients=clients,
-            cookies_file=cookies_file,
+            cookies_file=attempt_cookies,
         )
         try:
             info = await asyncio.to_thread(_extract_sync, url, opts, download=download)

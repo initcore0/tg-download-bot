@@ -138,6 +138,50 @@ class TestRetry:
             await ytdlp.extract("https://youtube.com/x", tmp_path, max_height=720, max_attempts=3)
         assert calls["n"] == 3
 
+    async def test_youtube_drops_cookies_on_later_attempts(self, monkeypatch, tmp_path):
+        # With a logged-in session YouTube serves SABR-only web formats and yt-dlp
+        # skips cookie-incompatible clients, so later rungs must go anonymous.
+        seen_cookies: list[str | None] = []
+
+        def fake_sync(url, opts, *, download):
+            seen_cookies.append(opts.get("cookiefile"))
+            raise TransientExtractionError("Requested format is not available")
+
+        monkeypatch.setattr(ytdlp, "_extract_sync", fake_sync)
+        monkeypatch.setattr(ytdlp.asyncio, "sleep", _no_sleep)
+
+        jar = tmp_path / "yt.txt"
+        with pytest.raises(TransientExtractionError):
+            await ytdlp.extract(
+                "https://youtube.com/shorts/abc",
+                tmp_path,
+                max_height=720,
+                max_attempts=4,
+                cookies_file=jar,
+            )
+        assert seen_cookies == [str(jar), str(jar), None, None]
+
+    async def test_non_youtube_keeps_cookies_on_every_attempt(self, monkeypatch, tmp_path):
+        seen_cookies: list[str | None] = []
+
+        def fake_sync(url, opts, *, download):
+            seen_cookies.append(opts.get("cookiefile"))
+            raise TransientExtractionError("HTTP Error 429")
+
+        monkeypatch.setattr(ytdlp, "_extract_sync", fake_sync)
+        monkeypatch.setattr(ytdlp.asyncio, "sleep", _no_sleep)
+
+        jar = tmp_path / "insta.txt"
+        with pytest.raises(TransientExtractionError):
+            await ytdlp.extract(
+                "https://instagram.com/stories/u/1/",
+                tmp_path,
+                max_height=720,
+                max_attempts=4,
+                cookies_file=jar,
+            )
+        assert seen_cookies == [str(jar)] * 4
+
     async def test_cycles_youtube_clients_across_attempts(self, monkeypatch, tmp_path):
         seen_clients: list[list[str]] = []
 
