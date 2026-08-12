@@ -177,6 +177,86 @@ class TestRun:
         assert runtime.get_bot_username() is None
 
 
+class TestCookies:
+    """Cookies can arrive as env-var content (raw, base64, or escaped) or a file path."""
+
+    NETSCAPE = "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tsid\tabc123\n"
+
+    def _settings(self, **kwargs) -> Settings:
+        # Pin every cookies field so the host's real .env/environment can't leak in.
+        defaults: dict = {
+            "telegram_bot_token": "t",
+            "cookies": "",
+            "youtube_cookies": "",
+            "cookies_file": None,
+            "youtube_cookies_file": None,
+        }
+        defaults.update(kwargs)
+        return Settings(**defaults)
+
+    def test_raw_content_is_written_to_temp_file(self):
+        path, is_temp = main_mod._materialize_cookies(self._settings(cookies=self.NETSCAPE))
+        try:
+            assert is_temp and path is not None
+            assert path.read_text() == self.NETSCAPE
+            assert (path.stat().st_mode & 0o777) == 0o600
+        finally:
+            path.unlink()
+
+    def test_base64_content_is_decoded(self):
+        import base64
+
+        encoded = base64.b64encode(self.NETSCAPE.encode()).decode()
+        path, is_temp = main_mod._materialize_cookies(self._settings(cookies=encoded))
+        try:
+            assert is_temp
+            assert path.read_text() == self.NETSCAPE
+        finally:
+            path.unlink()
+
+    def test_single_line_escaped_content_is_unescaped(self):
+        escaped = self.NETSCAPE.rstrip("\n").replace("\t", "\\t").replace("\n", "\\n")
+        assert "\n" not in escaped  # what a one-line dashboard paste looks like
+        path, _ = main_mod._materialize_cookies(self._settings(cookies=escaped))
+        try:
+            assert path.read_text() == self.NETSCAPE
+        finally:
+            path.unlink()
+
+    def test_youtube_cookies_env_is_legacy_alias(self):
+        path, is_temp = main_mod._materialize_cookies(
+            self._settings(youtube_cookies=self.NETSCAPE)
+        )
+        try:
+            assert is_temp and path.read_text() == self.NETSCAPE
+        finally:
+            path.unlink()
+
+    def test_content_wins_over_file_path(self, tmp_path):
+        file_cookies = tmp_path / "cookies.txt"
+        file_cookies.write_text("# from file\n")
+        path, is_temp = main_mod._materialize_cookies(
+            self._settings(cookies=self.NETSCAPE, cookies_file=file_cookies)
+        )
+        try:
+            assert is_temp and path != file_cookies
+            assert path.read_text() == self.NETSCAPE
+        finally:
+            path.unlink()
+
+    def test_file_path_used_when_no_content(self, tmp_path):
+        file_cookies = tmp_path / "cookies.txt"
+        file_cookies.write_text("# from file\n")
+        path, is_temp = main_mod._materialize_cookies(
+            self._settings(cookies_file=file_cookies)
+        )
+        assert path == file_cookies and is_temp is False
+
+    def test_nothing_configured_returns_none(self):
+        path, is_temp = main_mod._materialize_cookies(self._settings())
+        assert path is None and is_temp is False
+
+
 class TestRuntimeState:
     def test_username_normalized_without_at(self):
         runtime.set_bot_username("@somebot")

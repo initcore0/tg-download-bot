@@ -114,8 +114,10 @@ All settings are read from the environment or a `.env` file. Only the token is r
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Global cap on simultaneous downloads. |
 | `MAX_PER_USER_CONCURRENT` | `1` | Max in-flight downloads per user (abuse guard). |
 | `DOWNLOAD_TIMEOUT_S` | `300` | Per-request timeout in seconds. |
-| `COOKIES_FILE` | — | Optional cookies.txt shared by both download engines; unlocks Instagram stories and login-gated posts, and bypasses YouTube's bot-check (see below). |
-| `YOUTUBE_COOKIES_FILE` | — | Legacy alias for `COOKIES_FILE` (used when `COOKIES_FILE` is unset). |
+| `COOKIES` | — | Optional cookies.txt **content** (raw or base64, auto-detected), shared by both download engines; unlocks Instagram stories and login-gated posts, and bypasses YouTube's bot-check (see below). Preferred over `COOKIES_FILE` on PaaS hosts. |
+| `YOUTUBE_COOKIES` | — | Legacy-named alias for `COOKIES` (used when `COOKIES` is unset). |
+| `COOKIES_FILE` | — | Optional path to a cookies.txt on disk; used when no content var is set. |
+| `YOUTUBE_COOKIES_FILE` | — | Legacy alias for `COOKIES_FILE`. |
 | `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, …). |
 
 ### YouTube "Sign in to confirm you're not a bot"
@@ -127,9 +129,11 @@ them with a bot-check. The bot handles this in two layers:
    with exponential backoff, cycling through the `android`, `ios`, and `tv` extraction
    clients, which bypass the bot-check in many cases without any credentials.
 2. **Cookies (reliable fallback)** — if retries aren't enough, export a `cookies.txt`
-   from a browser logged into YouTube (e.g. the "Get cookies.txt LOCALLY" extension),
-   place it in the mounted data dir, and set `YOUTUBE_COOKIES_FILE=data/cookies.txt`.
-   Use a throwaway account; the cookies file is a credential — keep it out of git (the
+   from a browser logged into YouTube (e.g. the "Get cookies.txt LOCALLY" extension)
+   and set `COOKIES` to its content — base64 is the safest form
+   (`base64 -w0 cookies.txt`; on macOS `base64 -i cookies.txt`). Alternatively mount
+   it as a file and set `COOKIES_FILE=data/cookies.txt`.
+   Use a throwaway account; the cookies are a credential — keep them out of git (the
    default `.gitignore` already excludes `data/`).
 
 ## Privacy

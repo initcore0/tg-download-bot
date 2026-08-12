@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     # browser cookies file (which may hold cookies for many sites) covers everything.
     cookies_file: Path | None = None
 
+    # Cookie *content* via environment — preferred on PaaS hosts (Coolify, etc.)
+    # where mounting a file is awkward. The value is the Netscape cookies.txt text
+    # itself, or its base64 encoding (auto-detected); it is materialized to a
+    # private temp file at startup and wins over the *_file path settings.
+    # COOKIES covers both engines; YOUTUBE_COOKIES is the legacy-named alias.
+    cookies: str = ""
+    youtube_cookies: str = ""
+
+    @property
+    def cookies_content(self) -> str:
+        return (self.cookies or self.youtube_cookies).strip()
+
     @property
     def effective_cookies_file(self) -> Path | None:
         return self.cookies_file or self.youtube_cookies_file
