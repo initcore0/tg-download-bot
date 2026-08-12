@@ -138,8 +138,10 @@ actionable `AuthRequiredError` ("error.login_required") wins.
 
 **Stories.** `instagram.com/stories/...` is always login-gated: with no cookies file
 configured the service fails fast with `AuthRequiredError` before either engine runs.
-A single Netscape `cookies.txt` (env `COOKIES_FILE`, legacy alias
-`YOUTUBE_COOKIES_FILE`) is shared by both engines.
+A single Netscape `cookies.txt` is shared by both engines — preferably as env-var
+*content* (`COOKIES`, raw or base64, materialized to a 0600 temp file at startup;
+legacy alias `YOUTUBE_COOKIES`), or as a file path (`COOKIES_FILE`, legacy alias
+`YOUTUBE_COOKIES_FILE`). Content wins over path.
 
 ## 6. Storage / audit (`tgdl/storage/`)
 
@@ -201,8 +203,10 @@ MAX_HEIGHT           default 720
 MAX_CONCURRENT_DOWNLOADS default 3
 DOWNLOAD_TIMEOUT_S   default 300
 LOG_LEVEL            default INFO
-COOKIES_FILE         optional Netscape cookies.txt shared by yt-dlp + gallery-dl
-                     (YouTube bot-check, Instagram stories/login-gated posts);
+COOKIES              optional Netscape cookies.txt CONTENT (raw or base64) shared by
+                     yt-dlp + gallery-dl (YouTube bot-check, Instagram stories/
+                     login-gated posts); legacy alias YOUTUBE_COOKIES
+COOKIES_FILE         same, as a file path; content vars win when both are set;
                      legacy alias YOUTUBE_COOKIES_FILE
 ```
 

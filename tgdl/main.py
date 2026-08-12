@@ -5,8 +5,13 @@ Fails fast with a clear one-line error if TELEGRAM_BOT_TOKEN is missing.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
+import os
 import sys
+import tempfile
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -23,6 +28,44 @@ log = logging.getLogger("tgdl")
 
 #: We only ever need these two update types (ARCHITECTURE.md §7).
 ALLOWED_UPDATES = ["message", "channel_post"]
+
+
+def _decode_cookies_content(content: str) -> str:
+    """Normalize a COOKIES env value into Netscape cookies.txt text.
+
+    Accepts the raw file text (real newlines/tabs survive multiline env vars on
+    Coolify and in .env), its base64 encoding (a single line without tabs — the
+    safest way to pass it through any dashboard), or a single-line paste with
+    literal ``\\n``/``\\t`` escape sequences.
+    """
+    content = content.strip()
+    if "\t" in content or "\n" in content or content.startswith("#"):
+        text = content
+    else:
+        try:
+            text = base64.b64decode(content.encode(), validate=True).decode()
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            text = content
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return text if text.endswith("\n") else text + "\n"
+
+
+def _materialize_cookies(settings: Settings) -> tuple[Path | None, bool]:
+    """Resolve the cookies source into a file path for the download engines.
+
+    Env-var content wins over the *_FILE path settings; it is written to a
+    0600 temp file (never the persistent data volume — the content is a
+    credential). Returns (path, is_temporary) so the caller can clean up.
+    """
+    content = settings.cookies_content
+    if not content:
+        return settings.effective_cookies_file, False
+    fd, name = tempfile.mkstemp(prefix="tgdl-cookies-", suffix=".txt")  # 0600 by default
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(_decode_cookies_content(content))
+    log.info("cookies loaded from environment variable into a private temp file")
+    return Path(name), True
 
 
 async def _resolve_username(bot: Bot) -> str | None:
@@ -50,8 +93,9 @@ async def run(settings: Settings) -> None:
             "for remuxing and transcoding. Install ffmpeg (the Docker image already "
             "includes it) and try again."
         )
-    ytdlp.configure(cookies_file=settings.effective_cookies_file)
-    gallerydl.configure(cookies_file=settings.effective_cookies_file)
+    cookies_file, cookies_is_temp = _materialize_cookies(settings)
+    ytdlp.configure(cookies_file=cookies_file)
+    gallerydl.configure(cookies_file=cookies_file)
 
     try:
         await repo.init_db(settings.database_path)
@@ -103,6 +147,11 @@ async def run(settings: Settings) -> None:
             await bot.session.close()
         except Exception:
             log.exception("error closing bot session")
+        if cookies_is_temp and cookies_file is not None:
+            try:
+                cookies_file.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove temp cookies file %s", cookies_file)
 
 
 async def _healthcheck(settings: Settings) -> int:
