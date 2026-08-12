@@ -53,6 +53,12 @@ class TestClassifyFailure:
             "[instagram][error] AuthorizationError: Login required",
             "HTTP redirect to login page (401 Unauthorized)",
             "[twitter][error] authentication required",
+            # Real-world Instagram login wall phrasing (regression: was classified
+            # generic, so the retry-with-session never fired).
+            (
+                "[instagram][error] HTTP redirect to login page "
+                "(https://www.instagram.com/accounts/login/)"
+            ),
         ],
     )
     def test_auth(self, stderr):

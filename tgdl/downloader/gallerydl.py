@@ -83,6 +83,11 @@ _AUTH_MARKERS = (
     "account required",
     "logged-in",
     "cookies needed",
+    # Instagram phrases the wall as a redirect, e.g.
+    # "HTTP redirect to login page (https://www.instagram.com/accounts/login/)".
+    "redirect to login",
+    "login page",
+    "accounts/login",
 )
 _UNSUPPORTED_MARKERS = (
     "unsupported url",
