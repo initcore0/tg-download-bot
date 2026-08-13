@@ -11,11 +11,11 @@ degrade.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from tgdl.storage import db as _db
@@ -32,6 +32,20 @@ _sessionmaker: async_sessionmaker | None = None
 
 _MAX_ERROR_MESSAGE = 2000
 _MAX_TITLE = 1000
+
+#: Only these kinds may be replayed from the file_id cache. An image gallery stores
+#: just the *first* item's file_id in its audit row, so replaying one would silently
+#: drop the rest of the carousel.
+CACHEABLE_MEDIA_KINDS = ("video", "animation")
+
+#: How long a Telegram file_id is trusted before we re-download instead.
+DEFAULT_CACHE_MAX_AGE_DAYS = 30
+
+#: Audit rows older than this are deleted on startup.
+DEFAULT_RETENTION_DAYS = 90
+
+#: A row still 'pending' after this long belongs to a crashed run, not a live download.
+DEFAULT_STALE_PENDING_S = 3600
 
 
 def _session() -> AsyncSession:
@@ -101,6 +115,71 @@ async def create_request(
             session.add(request)
 
         return request
+
+
+async def find_cached_file_id(
+    normalized_url: str, *, max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS
+) -> DownloadRequest | None:
+    """Most recent successful, still-fresh row for `normalized_url` that can be replayed.
+
+    Returns None when nothing qualifies. Only video/animation rows are eligible
+    (see CACHEABLE_MEDIA_KINDS). Like `create_request` this may raise — the caller
+    decides how to degrade (the bot falls through to a normal download).
+    """
+    if not normalized_url:
+        return None
+
+    cutoff = _utcnow() - timedelta(days=max_age_days)
+    async with _session() as session:
+        row = (
+            await session.execute(
+                select(DownloadRequest)
+                .where(
+                    DownloadRequest.normalized_url == normalized_url,
+                    DownloadRequest.status == "success",
+                    DownloadRequest.telegram_file_id.is_not(None),
+                    DownloadRequest.media_kind.in_(CACHEABLE_MEDIA_KINDS),
+                    DownloadRequest.created_at >= cutoff,
+                )
+                .order_by(DownloadRequest.created_at.desc(), DownloadRequest.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    return row
+
+
+async def prune_audit(
+    *,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    stale_pending_s: int = DEFAULT_STALE_PENDING_S,
+) -> dict[str, int]:
+    """Housekeeping: drop expired rows and close out rows a crashed run left pending.
+
+    Returns {"deleted": n, "stale_pending": n}. Called at startup; the caller keeps
+    going if it raises.
+    """
+    now = _utcnow()
+    async with _session() as session, session.begin():
+        deleted = (
+            await session.execute(
+                delete(DownloadRequest).where(
+                    DownloadRequest.created_at < now - timedelta(days=retention_days)
+                )
+            )
+        ).rowcount
+        stale = (
+            await session.execute(
+                update(DownloadRequest)
+                .where(
+                    DownloadRequest.status == "pending",
+                    DownloadRequest.created_at < now - timedelta(seconds=stale_pending_s),
+                )
+                .values(status="failed", error_class="StaleRequest", completed_at=now)
+            )
+        ).rowcount
+
+    return {"deleted": deleted or 0, "stale_pending": stale or 0}
 
 
 async def mark_success(

@@ -126,16 +126,38 @@ def make_media(
     return MediaResult(**defaults)
 
 
+def cached_row(**overrides) -> SimpleNamespace:
+    """An audit row as `find_cached_file_id` returns it (a cache hit)."""
+    defaults = {
+        "telegram_file_id": "cached-file-id",
+        "media_kind": "video",
+        "platform": "youtube",
+        "title": "A clip",
+        "filesize_bytes": 4242,
+        "width": 1280,
+        "height": 720,
+        "duration_s": 12.7,
+        "transcoded": False,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
 @pytest.fixture
 def mock_repo(monkeypatch):
-    """Patch every repo function used by handlers; returns the namespace of mocks."""
+    """Patch every repo function used by handlers; returns the namespace of mocks.
+
+    `find_cached_file_id` defaults to a miss so the standard tests exercise the
+    normal download path.
+    """
     request_row = SimpleNamespace(id=99)
     mocks = SimpleNamespace(
         create_request=AsyncMock(return_value=request_row),
         mark_success=AsyncMock(),
         mark_failure=AsyncMock(),
+        find_cached_file_id=AsyncMock(return_value=None),
     )
-    for name in ("create_request", "mark_success", "mark_failure"):
+    for name in ("create_request", "mark_success", "mark_failure", "find_cached_file_id"):
         monkeypatch.setattr(handlers.repo, name, getattr(mocks, name))
     return mocks
 
@@ -797,6 +819,181 @@ class TestConcurrency:
         await handlers.handle_private(make_message("https://youtu.be/b", user_id=2), settings)
 
         assert mock_download.await_count == 2
+
+
+class TestFileIdCache:
+    """A link we've already uploaded is re-sent by file_id — no download at all."""
+
+    async def test_cache_hit_sends_by_file_id_and_skips_download(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_repo.find_cached_file_id.return_value = cached_row()
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)
+
+        mock_download.assert_not_awaited()
+        msg.answer_video.assert_awaited_once()
+        # The file_id string is passed straight through, not an FSInputFile.
+        assert msg.answer_video.await_args.args[0] == "cached-file-id"
+        kwargs = msg.answer_video.await_args.kwargs
+        assert kwargs["width"] == 1280 and kwargs["height"] == 720
+        assert kwargs["duration"] == 12  # int-coerced
+        assert kwargs["supports_streaming"] is True
+
+    async def test_cache_hit_is_audited_as_success(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_repo.find_cached_file_id.return_value = cached_row()
+
+        await handlers.handle_private(make_message("https://youtu.be/abc"), settings)
+
+        success_kwargs = mock_repo.mark_success.await_args.kwargs
+        assert success_kwargs["request_id"] == 99
+        assert success_kwargs["telegram_file_id"] == "vid-file-id"
+        media = success_kwargs["media"]
+        assert media.kind == "video"
+        assert media.filesize == 4242
+        assert media.width == 1280 and media.duration_s == 12.7
+
+    async def test_cached_animation_uses_animation_sender(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_repo.find_cached_file_id.return_value = cached_row(media_kind="animation")
+
+        await handlers.handle_private(make_message("https://example.com/gif"), settings)
+
+        msg_call = mock_repo.mark_success.await_args.kwargs["media"]
+        assert msg_call.kind == "animation"
+        mock_download.assert_not_awaited()
+
+    async def test_cache_hit_replies_in_groups(
+        self, settings, mock_repo, mock_download
+    ):
+        mock_repo.find_cached_file_id.return_value = cached_row()
+        msg = make_message(f"@{BOT_USERNAME} https://youtu.be/abc", chat_type="group")
+
+        await handlers.handle_group(msg, settings)
+
+        msg.reply_video.assert_awaited_once()
+        msg.answer_video.assert_not_awaited()
+
+    async def test_cache_hit_does_not_hold_the_download_semaphore(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        """A cached re-send must not queue behind (or block) real downloads."""
+        runtime.reset()
+        runtime.configure(1, BOT_USERNAME, max_per_user=10)
+        # Only the second link is cached; the first must really download.
+        mock_repo.find_cached_file_id.side_effect = (
+            lambda url, **kwargs: cached_row() if url.endswith("abc") else None
+        )
+
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _download(url, workdir, **kwargs):
+            started.set()
+            await release.wait()
+            return [make_media(Path(workdir))]
+
+        mock_download.side_effect = _download
+
+        # A real download holds the only global slot for the whole test.
+        blocker = asyncio.create_task(
+            handlers.handle_private(
+                make_message("https://youtu.be/slow", user_id=1), settings
+            )
+        )
+        await started.wait()
+
+        cached_msg = make_message("https://youtu.be/abc", user_id=2)
+        await asyncio.wait_for(
+            handlers.handle_private(cached_msg, settings), timeout=2
+        )
+        cached_msg.answer_video.assert_awaited_once()
+
+        release.set()
+        await blocker
+
+    async def test_stale_file_id_falls_through_to_download(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        """Telegram rejecting a forgotten file_id is a cache miss, not a failure."""
+        mock_repo.find_cached_file_id.return_value = cached_row()
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://youtu.be/abc")
+        msg.answer_video = AsyncMock(
+            side_effect=[RuntimeError("wrong file identifier"), sent_video("vid-file-id")]
+        )
+
+        await handlers.handle_private(msg, settings)
+
+        mock_download.assert_awaited_once()
+        assert msg.answer_video.await_count == 2
+        mock_repo.mark_success.assert_awaited_once()
+        mock_repo.mark_failure.assert_not_awaited()
+
+    async def test_repo_error_falls_through_to_download(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        mock_repo.find_cached_file_id.side_effect = RuntimeError("db down")
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)  # must not raise
+
+        mock_download.assert_awaited_once()
+        msg.answer_video.assert_awaited_once()
+
+    async def test_images_are_never_served_from_cache(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        """An image row's file_id covers only the first carousel item — always re-download.
+
+        The repo query already excludes images; this guards the handler side too.
+        """
+        mock_repo.find_cached_file_id.return_value = cached_row(media_kind="image")
+        mock_download.return_value = [
+            make_media(tmp_path, kind="image", name=f"i{i}.jpg") for i in range(3)
+        ]
+        msg = make_message("https://instagram.com/p/carousel")
+
+        await handlers.handle_private(msg, settings)
+
+        msg.answer_photo.assert_not_awaited()
+        mock_download.assert_awaited_once()
+        msg.answer_media_group.assert_awaited_once()
+
+    async def test_instagram_stories_bypass_the_cache(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        """Stories expire within 24h — a cached file_id would be a stale surprise."""
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://instagram.com/stories/someone/123/")
+
+        await handlers.handle_private(msg, settings)
+
+        mock_repo.find_cached_file_id.assert_not_awaited()
+        mock_download.assert_awaited_once()
+
+    async def test_cache_lookup_uses_the_normalized_url(
+        self, settings, tmp_path, monkeypatch, mock_repo, mock_download
+    ):
+        from tgdl.downloader import urls as urls_mod
+
+        monkeypatch.setattr(
+            urls_mod, "normalize_url", lambda url: "https://youtube.com/watch?v=abc"
+        )
+        mock_download.return_value = [make_media(tmp_path)]
+
+        await handlers.handle_private(
+            make_message("https://youtu.be/abc?si=track"), settings
+        )
+
+        assert mock_repo.find_cached_file_id.await_args.args[0] == (
+            "https://youtube.com/watch?v=abc"
+        )
 
 
 class TestFileIdExtraction:

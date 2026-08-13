@@ -1,7 +1,8 @@
 """aiogram handlers: commands, private URL messages, group/channel mentions.
 
 Request flow implemented here mirrors ARCHITECTURE.md §4:
-  extract URL -> audit -> chat-action status -> semaphore -> download -> send -> audit -> cleanup.
+  extract URL -> audit -> chat-action status -> file_id cache -> semaphore -> download
+  -> send -> audit -> cleanup.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
@@ -35,6 +37,9 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'\]\)]+", re.IGNORECASE)
 
 #: Telegram accepts at most 10 items in a media group.
 MEDIA_GROUP_LIMIT = 10
+
+#: Per-request workdir name prefix; the startup sweep in main.py matches on it.
+WORKDIR_PREFIX = "req-"
 
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
@@ -147,6 +152,83 @@ async def _audit_failure(request_id: int | None, error: BaseException, elapsed_s
         await repo.mark_failure(request_id=request_id, error=error, elapsed_s=elapsed_s)
     except Exception:
         log.exception("audit: mark_failure failed")
+
+
+# ----------------------------------------------------------------- file_id cache
+# The fastest possible download is the one we don't do: Telegram will re-send any
+# file we already uploaded if we hand it back the file_id (ARCHITECTURE.md §6.1).
+# Videos and animations only — an image gallery's audit row holds just the first
+# item's file_id, so replaying it would silently drop the rest of the carousel.
+
+
+def _is_story_url(url: str) -> bool:
+    """True for instagram.com/stories/... links, which expire and must never be cached.
+
+    Mirrors `service._is_instagram_story` without the platform lookup: a false
+    positive here only costs us a cache miss.
+    """
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return False
+    return path.strip("/").startswith("stories/")
+
+
+async def _try_send_cached(
+    message: Message, url: str, *, quote: bool
+) -> tuple[str, MediaResult] | None:
+    """Re-send a previously uploaded file by file_id. Returns (file_id, media) or None.
+
+    Never raises: a repo error or a file_id Telegram has since forgotten just means
+    a cache miss, and the caller downloads as usual.
+    """
+    try:
+        if _is_story_url(url):
+            return None
+
+        row = await repo.find_cached_file_id(_safe_normalized(url))
+        if row is None:
+            return None
+
+        file_id = row.telegram_file_id
+        # The repo query already filters these out; belt-and-braces, because
+        # replaying an image row would ship a carousel as a single photo.
+        if not file_id or row.media_kind not in repo.CACHEABLE_MEDIA_KINDS:
+            return None
+
+        duration = int(row.duration_s) if row.duration_s else None
+        if row.media_kind == "video":
+            sender = message.reply_video if quote else message.answer_video
+            sent = await sender(
+                file_id,
+                width=row.width,
+                height=row.height,
+                duration=duration,
+                supports_streaming=True,
+            )
+        else:  # animation
+            sender = message.reply_animation if quote else message.answer_animation
+            sent = await sender(
+                file_id, width=row.width, height=row.height, duration=duration
+            )
+
+        log.info("cache hit for %s (%s)", url, row.media_kind)
+        media = MediaResult(
+            path=Path("cached"),
+            kind=row.media_kind,
+            source_url=url,
+            platform=row.platform or "other",
+            filesize=row.filesize_bytes or 0,
+            title=row.title,
+            width=row.width,
+            height=row.height,
+            duration_s=row.duration_s,
+            transcoded=bool(row.transcoded),
+        )
+        return _extract_file_id(sent) or file_id, media
+    except Exception:
+        log.info("file_id cache unusable for %s; downloading instead", url, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------- send helpers
@@ -288,10 +370,22 @@ async def _run_download(
 
     workdir: Path | None = None
     try:
+        # Already uploaded this link once? Re-send by file_id — no download, no
+        # semaphore, no workdir. Cheap enough to run inside the user slot.
+        cached = await _try_send_cached(message, url, quote=quote)
+        if cached is not None:
+            cached_file_id, cached_media = cached
+            await _audit_success(
+                request_id, cached_media, cached_file_id, time.monotonic() - started
+            )
+            return
+
+        # The semaphore caps concurrent *downloads* only: uploading to Telegram is
+        # network-bound and shouldn't keep the next requester queued behind us.
         async with runtime.get_semaphore():
             base = Path(settings.download_dir)
             base.mkdir(parents=True, exist_ok=True)
-            workdir = Path(tempfile.mkdtemp(prefix="req-", dir=base))
+            workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX, dir=base))
 
             async with ChatActionSender.typing(
                 bot=message.bot, chat_id=message.chat.id
@@ -304,18 +398,18 @@ async def _run_download(
                     timeout_s=settings.download_timeout_s,
                 )
 
-            if not results:
-                raise DownloadError("downloader returned no results")
+        if not results:
+            raise DownloadError("downloader returned no results")
 
-            # Upload phase: the download succeeded and we know the media kind, so
-            # now (and only now) show the matching "sending a photo/video…" action.
-            action_sender = (
-                ChatActionSender.upload_photo
-                if all(r.kind == "image" for r in results)
-                else ChatActionSender.upload_video
-            )
-            async with action_sender(bot=message.bot, chat_id=message.chat.id):
-                file_id = await _send_results(message, results, quote=quote)
+        # Upload phase: the download succeeded and we know the media kind, so
+        # now (and only now) show the matching "sending a photo/video…" action.
+        action_sender = (
+            ChatActionSender.upload_photo
+            if all(r.kind == "image" for r in results)
+            else ChatActionSender.upload_video
+        )
+        async with action_sender(bot=message.bot, chat_id=message.chat.id):
+            file_id = await _send_results(message, results, quote=quote)
 
         await _audit_success(request_id, results[0], file_id, time.monotonic() - started)
 

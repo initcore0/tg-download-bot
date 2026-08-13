@@ -7,7 +7,7 @@ test asserts the schema carries no identifying columns.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -457,6 +457,155 @@ async def test_stats_counts(db_path: Path):
         "success": 1,
         "failed": 1,
     }
+
+
+# ------------------------------------------------------------------ file_id cache
+
+
+async def _age_request(request_id: int, *, days: float) -> None:
+    """Backdate a row's created_at so age-sensitive queries can be exercised."""
+    async with repo._session() as session, session.begin():
+        stored = await session.get(DownloadRequest, request_id)
+        stored.created_at = datetime.now(UTC) - timedelta(days=days)
+
+
+async def test_find_cached_file_id_returns_recent_success(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid-video", 1.0)
+
+    row = await repo.find_cached_file_id("https://youtube.com/watch?v=abc")
+
+    assert row is not None
+    assert row.telegram_file_id == "fid-video"
+    assert row.media_kind == "video"
+    assert row.width == 1280 and row.height == 720
+    assert row.duration_s == pytest.approx(42.5)
+
+
+async def test_find_cached_file_id_returns_most_recent_of_several(db_path: Path):
+    old = await new_request()
+    await repo.mark_success(old.id, make_media(), "fid-old", 1.0)
+    await _age_request(old.id, days=5)
+
+    fresh = await new_request()
+    await repo.mark_success(fresh.id, make_media(), "fid-fresh", 1.0)
+
+    row = await repo.find_cached_file_id("https://youtube.com/watch?v=abc")
+    assert row.telegram_file_id == "fid-fresh"
+
+
+async def test_find_cached_file_id_misses_when_too_old(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid-stale", 1.0)
+    await _age_request(request.id, days=45)
+
+    assert await repo.find_cached_file_id("https://youtube.com/watch?v=abc") is None
+    # ...but a caller willing to trust older file_ids still finds it.
+    row = await repo.find_cached_file_id(
+        "https://youtube.com/watch?v=abc", max_age_days=90
+    )
+    assert row.telegram_file_id == "fid-stale"
+
+
+async def test_find_cached_file_id_skips_images(db_path: Path):
+    """Image rows hold only the first carousel item's file_id — never replay them."""
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(kind="image"), "fid-photo", 1.0)
+
+    assert await repo.find_cached_file_id("https://youtube.com/watch?v=abc") is None
+
+
+async def test_find_cached_file_id_accepts_animations(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(kind="animation"), "fid-anim", 1.0)
+
+    row = await repo.find_cached_file_id("https://youtube.com/watch?v=abc")
+    assert row.media_kind == "animation"
+
+
+async def test_find_cached_file_id_skips_rows_without_file_id(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), None, 1.0)
+
+    assert await repo.find_cached_file_id("https://youtube.com/watch?v=abc") is None
+
+
+async def test_find_cached_file_id_skips_pending_and_failed(db_path: Path):
+    await new_request()  # pending
+    failed = await new_request()
+    await repo.mark_failure(failed.id, RuntimeError("nope"), 1.0)
+
+    assert await repo.find_cached_file_id("https://youtube.com/watch?v=abc") is None
+
+
+async def test_find_cached_file_id_misses_on_different_url(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid", 1.0)
+
+    assert await repo.find_cached_file_id("https://youtube.com/watch?v=other") is None
+    assert await repo.find_cached_file_id("") is None
+
+
+# --------------------------------------------------------------- audit retention
+
+
+async def test_prune_audit_deletes_expired_rows(db_path: Path):
+    old = await new_request()
+    await repo.mark_success(old.id, make_media(), "fid", 1.0)
+    await _age_request(old.id, days=200)
+    recent = await new_request()
+    await repo.mark_success(recent.id, make_media(), "fid2", 1.0)
+
+    result = await repo.prune_audit()
+
+    assert result["deleted"] == 1
+    async with repo._session() as session:
+        assert await session.get(DownloadRequest, old.id) is None
+        assert await session.get(DownloadRequest, recent.id) is not None
+
+
+async def test_prune_audit_marks_stale_pending_failed(db_path: Path):
+    stale = await new_request()
+    await _age_request(stale.id, days=1)
+
+    result = await repo.prune_audit()
+
+    assert result["stale_pending"] == 1
+    async with repo._session() as session:
+        stored = await session.get(DownloadRequest, stale.id)
+    assert stored.status == "failed"
+    assert stored.error_class == "StaleRequest"
+    assert stored.completed_at is not None
+
+
+async def test_prune_audit_leaves_in_flight_pending_alone(db_path: Path):
+    live = await new_request()
+
+    result = await repo.prune_audit()
+
+    assert result == {"deleted": 0, "stale_pending": 0}
+    async with repo._session() as session:
+        stored = await session.get(DownloadRequest, live.id)
+    assert stored.status == "pending"
+
+
+async def test_prune_audit_does_not_touch_completed_rows(db_path: Path):
+    done = await new_request()
+    await repo.mark_success(done.id, make_media(), "fid", 1.0)
+    await _age_request(done.id, days=1)
+
+    assert (await repo.prune_audit())["stale_pending"] == 0
+    async with repo._session() as session:
+        stored = await session.get(DownloadRequest, done.id)
+    assert stored.status == "success"
+
+
+async def test_prune_audit_honours_custom_windows(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid", 1.0)
+    await _age_request(request.id, days=2)
+
+    assert (await repo.prune_audit(retention_days=1))["deleted"] == 1
 
 
 # ------------------------------------------------------------------- timestamps

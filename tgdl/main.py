@@ -9,8 +9,10 @@ import base64
 import binascii
 import logging
 import os
+import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -28,6 +30,41 @@ log = logging.getLogger("tgdl")
 
 #: We only ever need these two update types (ARCHITECTURE.md §7).
 ALLOWED_UPDATES = ["message", "channel_post"]
+
+#: A workdir is only swept once it is this many times older than the download timeout,
+#: so a download running at the moment we start up is never pulled out from under it.
+ORPHAN_AGE_FACTOR = 2
+
+
+def sweep_orphan_workdirs(download_dir: Path, timeout_s: int) -> int:
+    """Delete `req-*` workdirs left behind by crashes or post-timeout zombie threads.
+
+    Returns how many were removed. Never raises: a dirty download dir is not a
+    reason to refuse to start.
+    """
+    removed = 0
+    try:
+        base = Path(download_dir)
+        if not base.is_dir():
+            return 0
+        cutoff = time.time() - timeout_s * ORPHAN_AGE_FACTOR
+        for entry in base.iterdir():
+            if not entry.name.startswith(handlers.WORKDIR_PREFIX) or not entry.is_dir():
+                continue
+            try:
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    except Exception:
+        log.exception("workdir sweep failed; continuing startup")
+        return removed
+
+    if removed:
+        log.info("removed %d orphaned download workdir(s) from %s", removed, download_dir)
+    return removed
 
 
 def _decode_cookies_content(content: str) -> str:
@@ -138,6 +175,21 @@ async def run(settings: Settings) -> None:
     except Exception:
         log.exception("database init failed")
         raise
+
+    # Housekeeping, best-effort: neither a full audit table nor a littered download
+    # dir is worth failing startup over.
+    try:
+        pruned = await repo.prune_audit()
+        if pruned["deleted"] or pruned["stale_pending"]:
+            log.info(
+                "audit pruned: %d expired row(s) deleted, %d stale pending row(s) closed",
+                pruned["deleted"],
+                pruned["stale_pending"],
+            )
+    except Exception:
+        log.exception("audit prune failed; continuing")
+
+    sweep_orphan_workdirs(settings.download_dir, settings.download_timeout_s)
 
     bot = Bot(
         token=settings.telegram_bot_token,

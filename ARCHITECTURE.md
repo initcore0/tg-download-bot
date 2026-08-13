@@ -13,9 +13,9 @@ Works in two contexts:
   Note: for groups, privacy mode should be disabled via BotFather (`/setprivacy` → Disable)
   so the bot reliably receives mention messages. In channels the bot must be an admin.
 
-Every request is audited in a database: who asked, what URL, what happened, how long it
-took, and the resulting Telegram `file_id` (which enables a future re-send-without-re-download
-optimization — **out of scope now**, but the schema supports it).
+Every request is audited in a database: what URL, what happened, how long it took, and
+the resulting Telegram `file_id` — which powers the re-send-without-re-download cache
+(§6.1): a link someone already fetched comes back instantly, with no download at all.
 
 ## 2. Design goals
 
@@ -26,8 +26,8 @@ optimization — **out of scope now**, but the schema supports it).
    "Video too large"), timeouts, and cleanup of temp files.
 4. **Audit everything.** Users + requests + outcomes in SQLite.
 
-Non-goals (explicitly): playlists, audio-only extraction, quality selection UI, caching/
-dedup by file_id (schema-ready only), rate limiting beyond a concurrency cap, ads/branding.
+Non-goals (explicitly): playlists, audio-only extraction, quality selection UI, rate
+limiting beyond a concurrency cap, ads/branding.
 
 ## 3. Stack
 
@@ -56,12 +56,17 @@ Telegram update
           ChatActionSender for the whole download (actions expire ~5s). Only after the
           download succeeds — when we know the link was downloadable and what it holds —
           does the upload phase switch to "sending a photo…"/"sending a video…".
-       4. Acquire global semaphore (MAX_CONCURRENT_DOWNLOADS, default 3).
-       5. downloader.service.download_media(url, workdir) → list[MediaResult]
-       6. Send media (sendVideo / sendPhoto / sendAnimation / sendMediaGroup),
+       4. file_id cache (§6.1): look up the normalized URL; on a hit re-send that
+          file_id and stop here — no semaphore, no workdir, no download. Any failure
+          (repo error, file_id Telegram has forgotten) is just a miss: fall through.
+       5. Acquire global semaphore (MAX_CONCURRENT_DOWNLOADS, default 3).
+       6. downloader.service.download_media(url, workdir) → list[MediaResult]
+       7. Release the semaphore — it caps concurrent *downloads*; the upload that
+          follows is network-bound and must not keep the next requester queued.
+       8. Send media (sendVideo / sendPhoto / sendAnimation / sendMediaGroup),
           reply-to the triggering message in groups. No caption.
-       7. Audit: mark_success(request, results, telegram_file_id) or mark_failure(request, error).
-       8. Delete workdir (always, in finally).
+       9. Audit: mark_success(request, results, telegram_file_id) or mark_failure(request, error).
+      10. Delete workdir (always, in finally).
 ```
 
 ## 5. Downloader pipeline (`tgdl/downloader/`)
@@ -136,6 +141,13 @@ the same per-file pipeline (`_process_file`): images pass through (webp→jpg), 
 yt-dlp error is re-raised — unless gallery-dl hit a login wall, in which case the more
 actionable `AuthRequiredError` ("error.login_required") wins.
 
+**When the fallback runs.** Only for `GALLERY_PLATFORMS` and `"other"`. Video-only
+platforms (youtube, tiktok, twitch) have no images to find, so their extraction errors
+go straight to the user. A `TransientExtractionError` (throttle, bot-check, 5xx) is
+re-raised before the fallback is even considered: it means "not right now", not "this
+post has no video", and running a second engine against it only burns more of the
+platform's patience.
+
 **Stories.** `instagram.com/stories/...` is always login-gated: with no cookies file
 configured the service fails fast with `AuthRequiredError` before either engine runs.
 **Cookie routing (`tgdl/downloader/cookies.py`).** Cookies live in per-platform jars
@@ -155,7 +167,7 @@ SQLite at `DATABASE_PATH` (default `data/tgdl.db`), WAL mode. Table created on s
 (`init_db()`); no migration tool needed yet.
 
 **Anonymous by design.** There is no user table and no identifying data. The audit exists
-to drive a future popular-link cache and to measure latency — neither needs to know who
+to drive the popular-link cache (§6.1) and to measure latency — neither needs to know who
 asked. The only contextual field is a coarse `chat_type`.
 
 ```
@@ -163,7 +175,7 @@ requests: id PK, chat_type NOT NULL,          -- coarse: private|group|supergrou
           url NOT NULL, normalized_url, platform,
           status (pending|success|failed), error_class, error_message,
           media_kind, title, filesize_bytes, duration_s, width, height,
-          transcoded BOOL, telegram_file_id,      -- future cache key
+          transcoded BOOL, telegram_file_id,      -- cache key (§6.1)
           created_at, completed_at, elapsed_s
 Indexes: requests(normalized_url), requests(created_at)
 ```
@@ -173,11 +185,41 @@ per-user rate-limit key (the Telegram id) lives only in memory (`tgdl/bot/runtim
 is never persisted.
 
 `normalized_url`: lowercase host, strip tracking params (`utm_*`, `si`, `feature`…),
-resolve youtu.be→youtube.com/watch form — this is the future dedup key.
+resolve youtu.be→youtube.com/watch form — this is the cache/dedup key.
 
-Repo API (`tgdl/storage/repo.py`): `init_db`, `create_request`, `mark_success`,
-`mark_failure`, `stats`. All async. Audit failures must never break the user flow (log and
-continue).
+Repo API (`tgdl/storage/repo.py`): `init_db`, `create_request`, `find_cached_file_id`,
+`mark_success`, `mark_failure`, `prune_audit`, `stats`. All async. Audit failures must
+never break the user flow (log and continue).
+
+### 6.1 file_id cache
+
+The fastest download is the one we skip. `find_cached_file_id(normalized_url)` returns
+the most recent audit row that is `status='success'`, has a `telegram_file_id`, and is
+younger than 30 days; the handler hands that file_id straight back to `sendVideo` /
+`sendAnimation` with the stored width/height/duration. Telegram re-serves its own copy,
+so the request costs one API call instead of a download + transcode + upload.
+
+Deliberate limits:
+- **Videos and animations only.** An image gallery's row stores only the *first* item's
+  file_id, so replaying it would silently drop the rest of a carousel. Serving images
+  from cache needs a schema change; until then they always re-download.
+- **Instagram stories are never cached** — they expire, so a hit would ship content the
+  poster has already taken down.
+- **Any failure is a miss.** A repo error, or a file_id Telegram has since forgotten, is
+  logged and falls through to the normal download path. The cache can never fail a request.
+
+### 6.2 Housekeeping (startup)
+
+Two best-effort passes run once in `main.run()`, after `init_db` and before polling.
+Neither can block startup: both are wrapped, log, and continue.
+
+- **`prune_audit()`** deletes rows older than 90 days, and marks rows still `pending`
+  after an hour as `failed` / `error_class='StaleRequest'` — those belong to a run that
+  crashed mid-download, not to anything in flight.
+- **`sweep_orphan_workdirs()`** deletes `req-*` dirs under `DOWNLOAD_DIR` whose mtime is
+  older than `2 × DOWNLOAD_TIMEOUT_S`. The `finally` in the handler cleans up the normal
+  path; this catches what a crash or a post-timeout zombie yt-dlp thread left behind. The
+  2× margin guarantees a download running right now is never swept out from under itself.
 
 ## 7. Bot layer (`tgdl/bot/`)
 
@@ -185,7 +227,8 @@ continue).
 - Handlers: `/start`, `/help` (short usage text), private-message URL handler,
   group/channel mention handler (`message` + `channel_post` updates).
 - Upload via `FSInputFile`; `sendVideo(width, height, duration, supports_streaming=True)`.
-- Store returned `message.video.file_id` into the audit row.
+- Store returned `message.video.file_id` into the audit row — that write is what
+  populates the §6.1 cache for the next person who sends the same link.
 - Per-chat politeness: reply_to the triggering message in groups; plain send in private.
 - Errors: the localized message for `DownloadError.message_key` (or a caller-supplied
   `custom_message`) shown to user; unexpected exceptions → generic "Something went wrong"

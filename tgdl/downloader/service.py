@@ -20,6 +20,7 @@ from tgdl.downloader.models import (
     ExtractionError,
     MediaResult,
     MediaTooLargeError,
+    TransientExtractionError,
     UnsupportedUrlError,
 )
 from tgdl.downloader.urls import detect_platform, is_safe_public_url
@@ -112,10 +113,18 @@ async def _run_pipeline(
             playlist_items=playlist_items,
             cookies_file=cookies.resolve(platform, story=story),
         )
+    except TransientExtractionError:
+        # Throttling or a bot-check says "not right now", not "this post has no
+        # video". Running the image engine against it only burns more of the
+        # platform's patience — surface the retryable error instead.
+        raise
     except (UnsupportedUrlError, ExtractionError) as exc:
         # yt-dlp only extracts videos. Image-only posts (Instagram photos, image
         # tweets, Pinterest pins) and story images land here — retry the URL
-        # through the gallery-dl image engine before giving up.
+        # through the gallery-dl image engine before giving up. Video-only
+        # platforms have no images to find, so they skip straight to the error.
+        if platform not in GALLERY_PLATFORMS and platform != "other":
+            raise
         return await _image_fallback(
             url,
             workdir,
