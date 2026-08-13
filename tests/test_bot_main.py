@@ -1,13 +1,16 @@
 """Tests for the entrypoint (tgdl/main.py) and bot runtime state."""
 from __future__ import annotations
 
+import os
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from tgdl import main as main_mod
-from tgdl.bot import runtime
+from tgdl.bot import handlers, runtime
 from tgdl.config import Settings
 
 
@@ -175,6 +178,113 @@ class TestRun:
         await main_mod.run(settings)  # must not raise
 
         assert runtime.get_bot_username() is None
+
+
+class TestWorkdirSweep:
+    """Crashes and post-timeout zombie yt-dlp threads leak `req-*` dirs; sweep them."""
+
+    TIMEOUT_S = 300
+
+    def _workdir(self, base: Path, name: str, *, age_s: float) -> Path:
+        d = base / name
+        d.mkdir(parents=True)
+        (d / "partial.part").write_bytes(b"junk")
+        stamp = time.time() - age_s
+        os.utime(d, (stamp, stamp))
+        return d
+
+    def test_old_workdirs_are_removed(self, tmp_path):
+        old = self._workdir(tmp_path, "req-abc123", age_s=self.TIMEOUT_S * 5)
+
+        assert main_mod.sweep_orphan_workdirs(tmp_path, self.TIMEOUT_S) == 1
+        assert not old.exists()
+
+    def test_recent_workdirs_survive(self, tmp_path):
+        """A download running right now must never have its workdir pulled away."""
+        live = self._workdir(tmp_path, "req-live", age_s=5)
+        # Still inside the timeout window, just past it once over: not yet orphaned.
+        recent = self._workdir(tmp_path, "req-recent", age_s=self.TIMEOUT_S * 1.5)
+
+        assert main_mod.sweep_orphan_workdirs(tmp_path, self.TIMEOUT_S) == 0
+        assert live.exists() and recent.exists()
+
+    def test_unrelated_entries_are_left_alone(self, tmp_path):
+        keeper = tmp_path / "keep-me"
+        keeper.mkdir()
+        os.utime(keeper, (0, 0))
+        stray_file = tmp_path / "req-not-a-dir.txt"
+        stray_file.write_bytes(b"x")
+        os.utime(stray_file, (0, 0))
+
+        assert main_mod.sweep_orphan_workdirs(tmp_path, self.TIMEOUT_S) == 0
+        assert keeper.exists() and stray_file.exists()
+
+    def test_missing_download_dir_is_not_an_error(self, tmp_path):
+        assert main_mod.sweep_orphan_workdirs(tmp_path / "nope", self.TIMEOUT_S) == 0
+
+    def test_sweep_never_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            main_mod.Path, "is_dir", MagicMock(side_effect=OSError("disk gone"))
+        )
+        assert main_mod.sweep_orphan_workdirs(tmp_path, self.TIMEOUT_S) == 0
+
+    def test_prefix_matches_the_one_handlers_use(self, tmp_path):
+        # The sweep is only correct while both sides agree on the prefix.
+        real = self._workdir(
+            tmp_path, f"{handlers.WORKDIR_PREFIX}xyz", age_s=self.TIMEOUT_S * 5
+        )
+        assert main_mod.sweep_orphan_workdirs(tmp_path, self.TIMEOUT_S) == 1
+        assert not real.exists()
+
+
+class TestStartupHousekeeping:
+    """Neither prune nor sweep may ever keep the bot from starting."""
+
+    def _patch_bot(self, monkeypatch):
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock()
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+    async def test_run_prunes_audit_and_sweeps_workdirs(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            database_path=tmp_path / "db.sqlite",
+            download_dir=tmp_path / "downloads",
+        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+        prune = AsyncMock(return_value={"deleted": 3, "stale_pending": 1})
+        monkeypatch.setattr(main_mod.repo, "prune_audit", prune)
+        sweep = MagicMock(return_value=0)
+        monkeypatch.setattr(main_mod, "sweep_orphan_workdirs", sweep)
+        self._patch_bot(monkeypatch)
+
+        await main_mod.run(settings)
+
+        prune.assert_awaited_once()
+        sweep.assert_called_once_with(settings.download_dir, settings.download_timeout_s)
+
+    async def test_prune_failure_does_not_block_startup(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC", database_path=tmp_path / "db.sqlite"
+        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            main_mod.repo, "prune_audit", AsyncMock(side_effect=RuntimeError("db busy"))
+        )
+        self._patch_bot(monkeypatch)
+
+        await main_mod.run(settings)  # must not raise
+
+        assert runtime.get_bot_username() == "mybot"
 
 
 class TestCookies:

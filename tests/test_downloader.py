@@ -20,6 +20,7 @@ from tgdl.downloader.models import (
     ExtractionError,
     MediaTooLargeError,
     TranscodeError,
+    TransientExtractionError,
     UnsupportedUrlError,
 )
 
@@ -207,25 +208,30 @@ class TestGalleries:
         assert results[0].path.name == "good.jpg"
 
 
+def stub_fetch(monkeypatch, sources: list[Path] | None, *, error=None, calls=None):
+    """Install a fake gallerydl.fetch that copies fixtures into the gallery subdir."""
+
+    async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
+        if calls is not None:
+            calls.append(url)
+        if error is not None:
+            raise error
+        dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
+        dest.mkdir(parents=True, exist_ok=True)
+        out = []
+        for index, src in enumerate(sources or []):
+            dst = dest / f"item{index}{src.suffix}"
+            shutil.copy(src, dst)
+            out.append(dst)
+        return out
+
+    monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+
+
 class TestImageFallback:
     """yt-dlp finds no video -> the gallery-dl image engine takes over."""
 
-    def _stub_fetch(self, monkeypatch, sources: list[Path] | None, *, error=None, calls=None):
-        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
-            if calls is not None:
-                calls.append(url)
-            if error is not None:
-                raise error
-            dest = Path(workdir) / service.gallerydl.DEST_SUBDIR
-            dest.mkdir(parents=True, exist_ok=True)
-            out = []
-            for index, src in enumerate(sources or []):
-                dst = dest / f"item{index}{src.suffix}"
-                shutil.copy(src, dst)
-                out.append(dst)
-            return out
-
-        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+    _stub_fetch = staticmethod(stub_fetch)
 
     async def test_no_video_post_falls_back_to_images(
         self, stub_extract, monkeypatch, jpg_file, tmp_path
@@ -312,6 +318,75 @@ class TestImageFallback:
             "https://instagram.com/p/x", tmp_path, max_size_bytes=CAP
         )
         assert [r.path.name for r in results] == ["good.jpg"]
+
+
+class TestFallbackGating:
+    """The image engine only runs where images are plausible, and never on a throttle."""
+
+    def _spy_fetch(self, monkeypatch, calls: list[str]):
+        async def _fetch(url, workdir, *, max_items=10, cookies_file=None):
+            calls.append(url)
+            raise AssertionError("gallery-dl must not run here")
+
+        monkeypatch.setattr(service.gallerydl, "fetch", _fetch)
+
+    async def test_transient_error_is_not_routed_to_fallback(
+        self, stub_extract, monkeypatch, tmp_path
+    ):
+        # A rate-limit means "not right now", not "this post has no video".
+        calls: list[str] = []
+        stub_extract([], error=TransientExtractionError("HTTP 429"))
+        self._spy_fetch(monkeypatch, calls)
+
+        with pytest.raises(TransientExtractionError):
+            await service.download_media(
+                "https://instagram.com/p/throttled", tmp_path, max_size_bytes=CAP
+            )
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://youtube.com/watch?v=x",
+            "https://tiktok.com/@u/video/1",
+            "https://clips.twitch.tv/SomeClip",
+        ],
+    )
+    async def test_video_only_platforms_skip_fallback(
+        self, stub_extract, monkeypatch, tmp_path, url
+    ):
+        original = ExtractionError("video unavailable")
+        stub_extract([], error=original)
+        calls: list[str] = []
+        self._spy_fetch(monkeypatch, calls)
+
+        with pytest.raises(ExtractionError) as excinfo:
+            await service.download_media(url, tmp_path, max_size_bytes=CAP)
+        assert excinfo.value is original
+        assert calls == []
+
+    async def test_gallery_platform_still_falls_back(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        stub_extract([], error=ExtractionError("There is no video in this post"))
+        stub_fetch(monkeypatch, [jpg_file])
+
+        (result,) = await service.download_media(
+            "https://instagram.com/p/photos", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "image"
+
+    async def test_unknown_platform_still_falls_back(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        # "other" covers arbitrary image hosts, so the fallback is still worth a shot.
+        stub_extract([], error=UnsupportedUrlError("Unsupported URL"))
+        stub_fetch(monkeypatch, [jpg_file])
+
+        (result,) = await service.download_media(
+            "https://example.com/gallery/1", tmp_path, max_size_bytes=CAP
+        )
+        assert result.kind == "image"
 
 
 class TestStories:
