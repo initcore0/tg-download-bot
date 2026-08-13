@@ -1,6 +1,7 @@
 """Tests for the entrypoint (tgdl/main.py) and bot runtime state."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -381,6 +382,167 @@ class TestCookies:
         assert temp == []
 
 
+class TestYtdlpFreshnessCheck:
+    """Extractors break weekly; a stale yt-dlp must be visible in the logs."""
+
+    def _stub_aiohttp(self, monkeypatch, *, latest: str | None, error: Exception | None = None):
+        """Patch aiohttp so no request leaves the machine."""
+        import aiohttp
+
+        class _Response:
+            def raise_for_status(self):
+                pass
+
+            async def json(self):
+                return {"info": {"version": latest}}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get(self, url):
+                if error is not None:
+                    raise error
+                return _Response()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(aiohttp, "ClientSession", _Session)
+
+    async def test_warns_when_a_newer_release_exists(self, monkeypatch, caplog):
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2020.01.01")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.31")
+
+        with caplog.at_level("WARNING", logger="tgdl"):
+            await main_mod.check_ytdlp_freshness()
+
+        assert any(
+            "2020.01.01" in r.message and "2099.12.31" in r.message
+            for r in caplog.records
+        )
+
+    async def test_silent_when_current(self, monkeypatch, caplog):
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2099.12.31")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.31")
+
+        with caplog.at_level("WARNING", logger="tgdl"):
+            await main_mod.check_ytdlp_freshness()
+
+        assert caplog.records == []
+
+    async def test_network_failure_is_swallowed(self, monkeypatch, caplog):
+        self._stub_aiohttp(monkeypatch, latest=None, error=OSError("no route to host"))
+
+        with caplog.at_level("WARNING", logger="tgdl"):
+            await main_mod.check_ytdlp_freshness()  # must not raise
+
+        assert caplog.records == []
+
+    async def test_unexpected_payload_is_swallowed(self, monkeypatch):
+        import aiohttp
+
+        class _Broken:
+            def __init__(self, *a, **kw):
+                pass
+
+            def get(self, url):
+                raise ValueError("not json")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(aiohttp, "ClientSession", _Broken)
+        await main_mod.check_ytdlp_freshness()  # must not raise
+
+    async def test_startup_launches_it_without_awaiting(self, monkeypatch, tmp_path):
+        """It runs in the background and is cancelled cleanly on shutdown."""
+        settings = Settings(
+            telegram_bot_token="123:ABC", database_path=tmp_path / "db.sqlite"
+        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            main_mod.repo, "prune_audit",
+            AsyncMock(return_value={"deleted": 0, "stale_pending": 0}),
+        )
+
+        ran = asyncio.Event()
+
+        async def _check():
+            ran.set()
+
+        monkeypatch.setattr(main_mod, "check_ytdlp_freshness", _check)
+
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
+
+        # Real polling blocks for a long time; a single yield stands in for that, and
+        # is what lets the background task get its turn.
+        async def _poll(*args, **kwargs):
+            await asyncio.sleep(0)
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock(side_effect=_poll)
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+        await main_mod.run(settings)
+
+        assert ran.is_set()
+
+    async def test_a_hanging_check_does_not_block_shutdown(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC", database_path=tmp_path / "db.sqlite"
+        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        close_db = AsyncMock()
+        monkeypatch.setattr(main_mod.repo, "close_db", close_db)
+        monkeypatch.setattr(
+            main_mod.repo, "prune_audit",
+            AsyncMock(return_value={"deleted": 0, "stale_pending": 0}),
+        )
+
+        async def _hang():
+            await asyncio.Event().wait()  # never completes
+
+        monkeypatch.setattr(main_mod, "check_ytdlp_freshness", _hang)
+
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock()
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+        await asyncio.wait_for(main_mod.run(settings), timeout=5)
+
+        close_db.assert_awaited_once()
+
+
 class TestRuntimeState:
     def test_username_normalized_without_at(self):
         runtime.set_bot_username("@somebot")
@@ -402,6 +564,140 @@ class TestRuntimeState:
     def test_semaphore_is_stable_across_calls(self):
         runtime.configure(2)
         assert runtime.get_semaphore() is runtime.get_semaphore()
+
+    def test_reset_clears_the_coalescing_state(self):
+        runtime.configure(2, follower_timeout_s=12)
+        runtime._leaders["https://x.test/1"] = asyncio.Event()
+
+        runtime.reset()
+
+        assert runtime._leaders == {}
+        assert runtime._follower_timeout_s == runtime.DEFAULT_FOLLOWER_TIMEOUT_S
+
+
+class TestCoalesceGate:
+    """Leader/follower gate for identical in-flight URLs (runtime-level contract)."""
+
+    async def test_first_caller_is_the_leader(self):
+        runtime.configure(2)
+        async with runtime.coalesce("https://x.test/1") as leader:
+            assert leader is True
+            assert "https://x.test/1" in runtime._leaders
+
+    async def test_entry_is_removed_and_event_set_on_exit(self):
+        runtime.configure(2)
+        async with runtime.coalesce("https://x.test/1"):
+            event = runtime._leaders["https://x.test/1"]
+        assert runtime._leaders == {}
+        assert event.is_set()
+
+    async def test_entry_is_released_even_when_the_body_raises(self):
+        runtime.configure(2)
+        with pytest.raises(RuntimeError):
+            async with runtime.coalesce("https://x.test/1"):
+                event = runtime._leaders["https://x.test/1"]
+                raise RuntimeError("leader exploded")
+        assert runtime._leaders == {}
+        assert event.is_set()
+
+    async def test_entry_is_released_on_cancellation(self):
+        runtime.configure(2)
+        entered = asyncio.Event()
+
+        async def _leader():
+            async with runtime.coalesce("https://x.test/1"):
+                entered.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(_leader())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert runtime._leaders == {}
+
+    async def test_follower_waits_for_the_leader_then_reports_false(self):
+        runtime.configure(2)
+        order: list[str] = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _leader():
+            async with runtime.coalesce("https://x.test/1"):
+                entered.set()
+                await release.wait()
+                order.append("leader done")
+
+        async def _follower():
+            async with runtime.coalesce("https://x.test/1") as leader:
+                assert leader is False
+                order.append("follower resumed")
+
+        leader_task = asyncio.create_task(_leader())
+        await entered.wait()
+        follower_task = asyncio.create_task(_follower())
+        await asyncio.sleep(0.02)
+        assert order == []  # still parked
+
+        release.set()
+        await asyncio.gather(leader_task, follower_task)
+        assert order == ["leader done", "follower resumed"]
+
+    async def test_follower_gives_up_after_the_configured_timeout(self):
+        runtime.configure(2, follower_timeout_s=0.02)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _leader():
+            async with runtime.coalesce("https://x.test/1"):
+                entered.set()
+                await release.wait()
+
+        leader_task = asyncio.create_task(_leader())
+        await entered.wait()
+
+        async with runtime.coalesce("https://x.test/1") as leader:
+            assert leader is False  # released by timeout, not by the leader
+
+        release.set()
+        await leader_task
+
+    async def test_a_follower_does_not_become_a_leader(self):
+        """One level only — no election loop for a third caller to queue behind."""
+        runtime.configure(2, follower_timeout_s=0.02)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _leader():
+            async with runtime.coalesce("https://x.test/1"):
+                entered.set()
+                await release.wait()
+
+        leader_task = asyncio.create_task(_leader())
+        await entered.wait()
+
+        async with runtime.coalesce("https://x.test/1"):
+            # The map still points at the real leader, never at the follower.
+            assert runtime._leaders["https://x.test/1"] is not None
+
+        release.set()
+        await leader_task
+        assert runtime._leaders == {}
+
+    async def test_empty_url_is_never_gated(self):
+        runtime.configure(2)
+        async with runtime.coalesce("") as leader:
+            assert leader is True
+        assert runtime._leaders == {}
+
+    async def test_distinct_urls_do_not_block_each_other(self):
+        runtime.configure(2)
+        async with (
+            runtime.coalesce("https://x.test/1"),
+            runtime.coalesce("https://x.test/2") as leader,
+        ):
+            assert leader is True
 
 
 class TestResponses:

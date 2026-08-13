@@ -10,12 +10,13 @@ degrade.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from tgdl.storage import db as _db
@@ -33,10 +34,13 @@ _sessionmaker: async_sessionmaker | None = None
 _MAX_ERROR_MESSAGE = 2000
 _MAX_TITLE = 1000
 
-#: Only these kinds may be replayed from the file_id cache. An image gallery stores
-#: just the *first* item's file_id in its audit row, so replaying one would silently
-#: drop the rest of the carousel.
-CACHEABLE_MEDIA_KINDS = ("video", "animation")
+#: Kinds that may be replayed from the file_id cache. Videos and animations are single
+#: files, so their `telegram_file_id` is the whole story; images need the full
+#: `telegram_file_ids` list, since replaying a carousel from one id would drop the rest.
+CACHEABLE_MEDIA_KINDS = ("video", "animation", "image")
+
+#: Image rows are only replayable once they carry the full ordered file_id list.
+_LIST_REQUIRED_MEDIA_KINDS = ("image",)
 
 #: How long a Telegram file_id is trusted before we re-download instead.
 DEFAULT_CACHE_MAX_AGE_DAYS = 30
@@ -117,14 +121,44 @@ async def create_request(
         return request
 
 
-async def find_cached_file_id(
+def encode_file_ids(file_ids: list[str] | None) -> str | None:
+    """JSON-encode an ordered file_id list for storage; None/empty stores NULL."""
+    cleaned = [f for f in (file_ids or []) if f]
+    return json.dumps(cleaned) if cleaned else None
+
+
+def decode_file_ids(row: DownloadRequest | Any) -> list[str]:
+    """Ordered file_ids of an audit row, falling back to the single-id column.
+
+    Never raises: a row written by an older build (or with a corrupt JSON blob) simply
+    degrades to whatever `telegram_file_id` holds.
+    """
+    raw = getattr(row, "telegram_file_ids", None)
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.debug("unreadable telegram_file_ids on row %s", getattr(row, "id", None))
+            decoded = None
+        if isinstance(decoded, list):
+            file_ids = [f for f in decoded if isinstance(f, str) and f]
+            if file_ids:
+                return file_ids
+
+    single = getattr(row, "telegram_file_id", None)
+    return [single] if single else []
+
+
+async def find_cached(
     normalized_url: str, *, max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS
 ) -> DownloadRequest | None:
     """Most recent successful, still-fresh row for `normalized_url` that can be replayed.
 
-    Returns None when nothing qualifies. Only video/animation rows are eligible
-    (see CACHEABLE_MEDIA_KINDS). Like `create_request` this may raise — the caller
-    decides how to degrade (the bot falls through to a normal download).
+    Returns None when nothing qualifies. Video and animation rows need only their
+    `telegram_file_id`; image rows additionally need the full `telegram_file_ids`
+    list, so a carousel is replayed whole or not at all (see CACHEABLE_MEDIA_KINDS).
+    Like `create_request` this may raise — the caller decides how to degrade (the bot
+    falls through to a normal download).
     """
     if not normalized_url:
         return None
@@ -140,6 +174,10 @@ async def find_cached_file_id(
                     DownloadRequest.telegram_file_id.is_not(None),
                     DownloadRequest.media_kind.in_(CACHEABLE_MEDIA_KINDS),
                     DownloadRequest.created_at >= cutoff,
+                    or_(
+                        DownloadRequest.media_kind.not_in(_LIST_REQUIRED_MEDIA_KINDS),
+                        DownloadRequest.telegram_file_ids.is_not(None),
+                    ),
                 )
                 .order_by(DownloadRequest.created_at.desc(), DownloadRequest.id.desc())
                 .limit(1)
@@ -147,6 +185,13 @@ async def find_cached_file_id(
         ).scalar_one_or_none()
 
     return row
+
+
+async def find_cached_file_id(
+    normalized_url: str, *, max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS
+) -> DownloadRequest | None:
+    """Backwards-compatible alias for `find_cached` (the name predates image caching)."""
+    return await find_cached(normalized_url, max_age_days=max_age_days)
 
 
 async def prune_audit(
@@ -187,8 +232,16 @@ async def mark_success(
     media: MediaResult,
     telegram_file_id: str | None,
     elapsed_s: float,
+    *,
+    telegram_file_ids: list[str] | None = None,
+    cache_hit: bool = False,
 ) -> None:
-    """Set status='success' plus media metadata. Must swallow+log its own errors."""
+    """Set status='success' plus media metadata. Must swallow+log its own errors.
+
+    `telegram_file_ids` is every file_id sent for this request, in order — a carousel
+    needs all of them to be replayable. `telegram_file_id` stays the first one.
+    `cache_hit` marks a row that was served from the cache instead of downloaded.
+    """
     try:
         async with _session() as session, session.begin():
             request = await session.get(DownloadRequest, request_id)
@@ -205,6 +258,10 @@ async def mark_success(
             request.height = media.height
             request.transcoded = bool(media.transcoded)
             request.telegram_file_id = telegram_file_id
+            request.telegram_file_ids = encode_file_ids(
+                telegram_file_ids if telegram_file_ids is not None else [telegram_file_id]
+            )
+            request.cache_hit = bool(cache_hit)
             request.platform = request.platform or media.platform
             request.completed_at = _utcnow()
             request.elapsed_s = elapsed_s

@@ -68,6 +68,9 @@ _PLATFORM_BY_HOST: dict[str, str] = {
     "clips.twitch.tv": "twitch",
     "pinterest.com": "pinterest",
     "pin.it": "pinterest",
+    "reddit.com": "reddit",
+    "old.reddit.com": "reddit",
+    "redd.it": "reddit",
 }
 
 
@@ -110,7 +113,7 @@ def extract_urls(text: str) -> list[str]:
 
 
 def detect_platform(url: str) -> str:
-    """Map a URL to a platform slug: youtube|tiktok|instagram|twitter|twitch|pinterest|other."""
+    """Map a URL to a slug: youtube|tiktok|instagram|twitter|twitch|pinterest|reddit|other."""
     host = _host_of(url)
     if not host:
         return "other"

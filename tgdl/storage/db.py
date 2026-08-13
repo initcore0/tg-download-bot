@@ -59,13 +59,45 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker:
 
 
 async def create_all(engine: AsyncEngine) -> None:
-    """Purge any legacy identifying data, then create missing tables/indexes. Idempotent."""
+    """Purge any legacy identifying data, then create/extend tables+indexes. Idempotent."""
     # Migration first, on its own autocommit connection (see _purge_* for why), then
-    # the normal schema creation in a transaction.
+    # the normal schema creation in a transaction, then the additive column backfill
+    # for tables that already existed (create_all leaves those untouched).
     async with engine.connect() as conn:
         await conn.run_sync(_purge_legacy_identifying_data)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
+def _add_missing_columns(sync_conn: Any) -> None:
+    """Add columns the ORM knows about but an existing table is missing.
+
+    `create_all` only creates whole tables, so a database written by an older build
+    keeps its old column set forever. SQLite's `ALTER TABLE ... ADD COLUMN` is cheap,
+    additive, and never touches existing rows, which is all the schema evolution this
+    project needs (new columns are always nullable or carry a default).
+
+    The DDL is compiled from the ORM column itself, so a type or default can't drift
+    away from the model. Runs on every startup and is a no-op once the schema matches.
+    """
+    from sqlalchemy import inspect
+    from sqlalchemy.schema import CreateColumn
+
+    inspector = inspect(sync_conn)
+    existing_tables = set(inspector.get_table_names())
+    dialect = sync_conn.dialect
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # just created by create_all — already current
+        present = {col["name"] for col in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            ddl = CreateColumn(column).compile(dialect=dialect)
+            logger.warning("adding missing column %s.%s", table.name, column.name)
+            sync_conn.exec_driver_sql(f"ALTER TABLE {table.name} ADD COLUMN {ddl}")
 
 
 # Columns that older versions stored on `requests` before the bot went anonymous.
