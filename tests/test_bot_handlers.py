@@ -80,6 +80,8 @@ def make_message(
     msg.reply_animation = AsyncMock(return_value=sent_animation("anim-file-id"))
     msg.answer_media_group = AsyncMock(return_value=[sent_photo("group-file-id")])
     msg.reply_media_group = AsyncMock(return_value=[sent_photo("group-file-id")])
+    msg.answer_audio = AsyncMock(return_value=sent_audio("audio-file-id"))
+    msg.reply_audio = AsyncMock(return_value=sent_audio("audio-file-id"))
     msg.react = AsyncMock()
 
     msg.bot = MagicMock()
@@ -103,6 +105,12 @@ def sent_photo(file_id: str):
 def sent_animation(file_id: str):
     return SimpleNamespace(
         video=None, photo=None, animation=SimpleNamespace(file_id=file_id)
+    )
+
+
+def sent_audio(file_id: str):
+    return SimpleNamespace(
+        video=None, photo=None, animation=None, audio=SimpleNamespace(file_id=file_id)
     )
 
 
@@ -178,6 +186,39 @@ def mock_download(monkeypatch):
     mock = AsyncMock()
     monkeypatch.setattr(handlers.service, "download_media", mock)
     return mock
+
+
+@pytest.fixture
+def mock_audio(monkeypatch):
+    """Patch audio.download_audio; test sets .return_value / .side_effect."""
+    mock = AsyncMock()
+    monkeypatch.setattr(handlers.audio_mod, "download_audio", mock)
+    return mock
+
+
+def make_audio(tmp_path: Path, name: str = "track.m4a", **overrides):
+    """An AudioResult as `download_audio` returns it."""
+    path = tmp_path / name
+    path.write_bytes(b"fake-audio-bytes")
+    defaults = {
+        "path": path,
+        "title": "A Song",
+        "duration_s": 123.4,
+        "filesize": path.stat().st_size,
+        "performer": "A Band",
+    }
+    defaults.update(overrides)
+    return handlers.audio_mod.AudioResult(**defaults)
+
+
+def audio_row(*, file_ids: list[str] | None = None, **overrides) -> SimpleNamespace:
+    """A cached audio audit row, as `find_cached(media_kinds=("audio",))` returns it."""
+    return cached_row(
+        media_kind="audio",
+        file_ids=file_ids or ["cached-audio-id"],
+        duration_s=123.4,
+        **overrides,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1371,3 +1412,566 @@ class TestDownloadErrorBase:
 
         sent_texts = [c.args[0] for c in msg.answer.await_args_list]
         assert "Nope, sorry." in sent_texts
+
+
+# ------------------------------------------------------------------------- /stats
+
+
+class TestStatsCommand:
+    """Admin-only, private-only, and silent in every other case."""
+
+    ADMIN_ID = 4242
+
+    @pytest.fixture
+    def admin_settings(self, settings) -> Settings:
+        return settings.model_copy(update={"admin_user_id": self.ADMIN_ID})
+
+    @pytest.fixture
+    def mock_stats(self, monkeypatch):
+        mock = AsyncMock(
+            return_value={
+                "requests": 5, "success": 4, "failed": 1, "pending": 0,
+                "cache_hits": 2, "hit_rate": 0.5,
+                "platforms": {"youtube": {"count": 4, "p50_s": 2.0, "p95_s": 9.0}},
+            }
+        )
+        monkeypatch.setattr(handlers.repo, "stats", mock)
+        return mock
+
+    async def test_admin_in_private_gets_the_summary(self, admin_settings, mock_stats):
+        msg = make_message("/stats", user_id=self.ADMIN_ID)
+
+        await handlers.cmd_stats(msg, admin_settings)
+
+        mock_stats.assert_awaited_once()
+        text = msg.answer.await_args.args[0]
+        assert "requests   5" in text
+        assert "youtube" in text
+
+    async def test_other_user_gets_nothing_at_all(self, admin_settings, mock_stats):
+        """Not an error either: the command must not advertise its own existence."""
+        msg = make_message("/stats", user_id=self.ADMIN_ID + 1)
+
+        await handlers.cmd_stats(msg, admin_settings)
+
+        mock_stats.assert_not_awaited()
+        msg.answer.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+
+    async def test_admin_in_a_group_gets_nothing(self, admin_settings, mock_stats):
+        """Even the admin: an ops readout does not belong in a shared chat."""
+        msg = make_message("/stats", chat_type="group", user_id=self.ADMIN_ID)
+
+        await handlers.cmd_stats(msg, admin_settings)
+
+        mock_stats.assert_not_awaited()
+        msg.answer.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+
+    async def test_disabled_when_admin_id_is_unset(self, settings, mock_stats):
+        assert settings.admin_user_id == 0
+        msg = make_message("/stats", user_id=0)
+
+        await handlers.cmd_stats(msg, settings)
+
+        mock_stats.assert_not_awaited()
+        msg.answer.assert_not_awaited()
+
+    async def test_message_without_a_user_is_ignored(self, admin_settings, mock_stats):
+        msg = make_message("/stats", from_user=False)
+
+        await handlers.cmd_stats(msg, admin_settings)
+
+        mock_stats.assert_not_awaited()
+
+    async def test_repo_failure_does_not_raise(self, admin_settings, monkeypatch):
+        monkeypatch.setattr(
+            handlers.repo, "stats", AsyncMock(side_effect=RuntimeError("db down"))
+        )
+        msg = make_message("/stats", user_id=self.ADMIN_ID)
+
+        await handlers.cmd_stats(msg, admin_settings)  # must not raise
+
+        assert msg.answer.await_args.args[0] == i18n.t("generic_error", "en")
+
+
+# --------------------------------------------------------------------------- /mp3
+
+
+class TestMp3Command:
+    async def test_usage_hint_when_no_url(self, settings, mock_repo, mock_audio):
+        msg = make_message("/mp3")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        mock_audio.assert_not_awaited()
+        assert msg.answer.await_args.args[0] == i18n.t("usage.mp3", "en")
+
+    async def test_usage_hint_is_localized(self, settings, mock_repo, mock_audio):
+        msg = make_message("/mp3", language_code="ru")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        assert msg.answer.await_args.args[0] == i18n.t("usage.mp3", "ru")
+
+    async def test_audio_sent_with_metadata_and_audited(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        mock_audio.assert_awaited_once()
+        kwargs = msg.answer_audio.await_args.kwargs
+        assert kwargs["title"] == "A Song"
+        assert kwargs["performer"] == "A Band"
+        assert kwargs["duration"] == 123  # int-coerced
+
+        success = mock_repo.mark_success.await_args.kwargs
+        assert success["telegram_file_id"] == "audio-file-id"
+        assert success["media_kind_override"] == "audio"
+
+    async def test_audio_alias_works(self, settings, tmp_path, mock_repo, mock_audio):
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/audio https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        msg.answer_audio.assert_awaited_once()
+
+    async def test_download_is_given_the_settings_cap_and_timeout(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_audio.return_value = make_audio(tmp_path)
+
+        await handlers.cmd_mp3(make_message("/mp3 https://youtu.be/abc"), settings)
+
+        kwargs = mock_audio.await_args.kwargs
+        assert kwargs["max_size_bytes"] == settings.max_file_size_bytes
+        assert kwargs["timeout_s"] == settings.download_timeout_s
+
+    async def test_works_in_groups_without_a_mention(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        """An explicit command is already explicit — no @botname required."""
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc", chat_type="group")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        msg.reply_audio.assert_awaited_once()
+        msg.answer_audio.assert_not_awaited()
+
+    async def test_error_is_localized_and_audited(
+        self, settings, mock_repo, mock_audio
+    ):
+        mock_audio.side_effect = MediaTooLargeError()
+        msg = make_message("/mp3 https://youtu.be/abc", language_code="ru")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        assert msg.answer.await_args.args[0] == i18n.t("error.too_large", "ru")
+        mock_repo.mark_failure.assert_awaited_once()
+
+    async def test_unexpected_error_does_not_escape(
+        self, settings, mock_repo, mock_audio
+    ):
+        mock_audio.side_effect = RuntimeError("boom")
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)  # must not raise
+
+        assert msg.answer.await_args.args[0] == i18n.t("generic_error", "en")
+        mock_repo.mark_failure.assert_awaited_once()
+
+    async def test_workdir_removed_after_the_download(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        seen: list[Path] = []
+
+        async def _download(url, workdir, **kwargs):
+            seen.append(Path(workdir))
+            return make_audio(Path(workdir))
+
+        mock_audio.side_effect = _download
+
+        await handlers.cmd_mp3(make_message("/mp3 https://youtu.be/abc"), settings)
+
+        assert seen and not seen[0].exists()
+
+    async def test_reaction_ack_is_set_and_cleared(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        assert msg.react.await_count == 2
+
+    async def test_per_user_limit_applies(self, settings, tmp_path, mock_repo, mock_audio):
+        runtime.reset()
+        runtime.configure(5, BOT_USERNAME, max_per_user=1)
+        release = asyncio.Event()
+
+        async def _download(url, workdir, **kwargs):
+            await release.wait()
+            return make_audio(Path(workdir))
+
+        mock_audio.side_effect = _download
+
+        first = asyncio.create_task(
+            handlers.cmd_mp3(make_message("/mp3 https://youtu.be/a"), settings)
+        )
+        await asyncio.sleep(0.05)
+        second = make_message("/mp3 https://youtu.be/b")
+        await handlers.cmd_mp3(second, settings)
+
+        assert second.answer.await_args.args[0] == i18n.t("busy_per_user", "en")
+        release.set()
+        await first
+
+
+class TestAudioCache:
+    """/mp3 has its own cache lane: audio rows only, and never a video row."""
+
+    async def test_cache_hit_replays_as_audio(self, settings, mock_repo, mock_audio):
+        mock_repo.find_cached.return_value = audio_row()
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        mock_audio.assert_not_awaited()
+        assert msg.answer_audio.await_args.args[0] == "cached-audio-id"
+        assert msg.answer_audio.await_args.kwargs["duration"] == 123
+
+    async def test_cache_hit_is_audited_as_an_audio_hit(
+        self, settings, mock_repo, mock_audio
+    ):
+        mock_repo.find_cached.return_value = audio_row()
+
+        await handlers.cmd_mp3(make_message("/mp3 https://youtu.be/abc"), settings)
+
+        success = mock_repo.mark_success.await_args.kwargs
+        assert success["cache_hit"] is True
+        assert success["media_kind_override"] == "audio"
+
+    async def test_mp3_asks_the_repo_only_for_audio_rows(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_audio.return_value = make_audio(tmp_path)
+
+        await handlers.cmd_mp3(make_message("/mp3 https://youtu.be/abc"), settings)
+
+        assert mock_repo.find_cached.await_args.kwargs["media_kinds"] == ("audio",)
+
+    async def test_video_flow_asks_only_for_video_kinds(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        mock_download.return_value = [make_media(tmp_path)]
+
+        await handlers.handle_private(make_message("https://youtu.be/abc"), settings)
+
+        kinds = mock_repo.find_cached.await_args.kwargs["media_kinds"]
+        assert kinds == ("video", "animation", "image")
+        assert "audio" not in kinds
+
+    async def test_a_video_row_is_never_served_to_mp3(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        """The repo filter does this; the handler double-checks the kind too."""
+        mock_repo.find_cached.return_value = cached_row(media_kind="video")
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        msg.answer_video.assert_not_awaited()
+        mock_audio.assert_awaited_once()  # fell through to a real audio download
+
+    async def test_an_audio_row_is_never_served_to_the_video_flow(
+        self, settings, tmp_path, mock_repo, mock_download
+    ):
+        mock_repo.find_cached.return_value = audio_row()
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)
+
+        msg.answer_audio.assert_not_awaited()
+        mock_download.assert_awaited_once()
+
+    async def test_repo_error_falls_through_to_a_download(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_repo.find_cached.side_effect = RuntimeError("db down")
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)  # must not raise
+
+        mock_audio.assert_awaited_once()
+        msg.answer_audio.assert_awaited_once()
+
+    async def test_stale_file_id_falls_through_to_a_download(
+        self, settings, tmp_path, mock_repo, mock_audio
+    ):
+        mock_repo.find_cached.return_value = audio_row()
+        mock_audio.return_value = make_audio(tmp_path)
+        msg = make_message("/mp3 https://youtu.be/abc")
+        msg.answer_audio = AsyncMock(
+            side_effect=[RuntimeError("wrong file identifier"), sent_audio("audio-file-id")]
+        )
+
+        await handlers.cmd_mp3(msg, settings)
+
+        mock_audio.assert_awaited_once()
+        assert msg.answer_audio.await_count == 2
+        mock_repo.mark_failure.assert_not_awaited()
+
+    async def test_coalescing_keys_do_not_collide(
+        self, settings, tmp_path, mock_repo, mock_audio, mock_download
+    ):
+        """A video download of a link must not gate an /mp3 of the same link."""
+        runtime.reset()
+        runtime.configure(5, BOT_USERNAME, max_per_user=10)
+        release = asyncio.Event()
+        video_started = asyncio.Event()
+
+        async def _video(url, workdir, **kwargs):
+            video_started.set()
+            await release.wait()
+            return [make_media(Path(workdir))]
+
+        mock_download.side_effect = _video
+        mock_audio.return_value = make_audio(tmp_path)
+
+        video = asyncio.create_task(
+            handlers.handle_private(
+                make_message("https://youtu.be/abc", user_id=1), settings
+            )
+        )
+        await video_started.wait()
+
+        # If the keys collided this would block until the video leader finished.
+        audio_msg = make_message("/mp3 https://youtu.be/abc", user_id=2)
+        await asyncio.wait_for(handlers.cmd_mp3(audio_msg, settings), timeout=2)
+
+        audio_msg.answer_audio.assert_awaited_once()
+        release.set()
+        await video
+
+    async def test_audio_gate_key_is_prefixed(self, settings, tmp_path, mock_repo, mock_audio):
+        seen: list[str] = []
+        real_coalesce = runtime.coalesce
+
+        def _spy(key):
+            seen.append(key)
+            return real_coalesce(key)
+
+        handlers.runtime.coalesce = _spy
+        try:
+            mock_audio.return_value = make_audio(tmp_path)
+            await handlers.cmd_mp3(make_message("/mp3 https://youtu.be/abc"), settings)
+        finally:
+            handlers.runtime.coalesce = real_coalesce
+
+        assert seen == [handlers.AUDIO_GATE_PREFIX + "https://youtu.be/abc"]
+
+
+# ---------------------------------------------------------------------- inline mode
+
+
+def make_inline_query(query: str = "", *, language_code: str | None = None) -> MagicMock:
+    """An InlineQuery test double with an AsyncMock `answer`."""
+    iq = MagicMock(name="InlineQuery")
+    iq.query = query
+    iq.from_user = SimpleNamespace(id=555, language_code=language_code)
+    iq.answer = AsyncMock()
+    return iq
+
+
+class TestInlineMode:
+    """Inline serves the file_id cache and nothing else — never a download."""
+
+    async def test_cached_video_is_answered(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row()
+        iq = make_inline_query("https://youtu.be/abc")
+
+        await handlers.handle_inline_query(iq)
+
+        results = iq.answer.await_args.args[0]
+        assert len(results) == 1
+        assert results[0].video_file_id == "cached-file-id"
+        assert results[0].type == "video"
+
+    async def test_cached_animation_is_answered_as_mpeg4_gif(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row(media_kind="animation")
+
+        iq = make_inline_query("https://example.com/gif")
+        await handlers.handle_inline_query(iq)
+
+        (result,) = iq.answer.await_args.args[0]
+        assert result.mpeg4_file_id == "cached-file-id"
+
+    async def test_cached_audio_is_answered_as_audio(self, mock_repo):
+        mock_repo.find_cached.return_value = audio_row()
+
+        iq = make_inline_query("https://youtu.be/abc")
+        await handlers.handle_inline_query(iq)
+
+        (result,) = iq.answer.await_args.args[0]
+        assert result.audio_file_id == "cached-audio-id"
+
+    async def test_single_cached_photo_is_answered(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row(
+            media_kind="image", file_ids=["p1"]
+        )
+
+        iq = make_inline_query("https://instagram.com/p/x")
+        await handlers.handle_inline_query(iq)
+
+        (result,) = iq.answer.await_args.args[0]
+        assert result.photo_file_id == "p1"
+
+    async def test_gallery_expands_to_one_result_per_photo(self, mock_repo):
+        """Inline has no media groups, so a carousel is offered item by item."""
+        mock_repo.find_cached.return_value = cached_row(
+            media_kind="image", file_ids=["p1", "p2", "p3"]
+        )
+
+        iq = make_inline_query("https://instagram.com/p/carousel")
+        await handlers.handle_inline_query(iq)
+
+        results = iq.answer.await_args.args[0]
+        assert [r.photo_file_id for r in results] == ["p1", "p2", "p3"]
+        assert len({r.id for r in results}) == 3, "result ids must be unique"
+
+    async def test_gallery_is_capped(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row(
+            media_kind="image", file_ids=[f"p{i}" for i in range(14)]
+        )
+
+        iq = make_inline_query("https://instagram.com/p/big")
+        await handlers.handle_inline_query(iq)
+
+        assert len(iq.answer.await_args.args[0]) == handlers.MEDIA_GROUP_LIMIT
+
+    async def test_hit_uses_a_long_impersonal_cache_time(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row()
+
+        iq = make_inline_query("https://youtu.be/abc")
+        await handlers.handle_inline_query(iq)
+
+        kwargs = iq.answer.await_args.kwargs
+        assert kwargs["cache_time"] == handlers.INLINE_CACHE_TIME_HIT_S
+        assert kwargs["is_personal"] is False
+
+    async def test_miss_answers_empty_with_a_switch_to_pm_button(self, mock_repo):
+        mock_repo.find_cached.return_value = None
+
+        iq = make_inline_query("https://youtu.be/uncached")
+        await handlers.handle_inline_query(iq)
+
+        assert iq.answer.await_args.args[0] == []
+        button = iq.answer.await_args.kwargs["button"]
+        assert button.text == i18n.t("inline.no_cache", "en")
+        assert button.start_parameter == handlers.INLINE_START_PARAMETER
+        assert iq.answer.await_args.kwargs["cache_time"] == handlers.INLINE_CACHE_TIME_MISS_S
+
+    async def test_button_text_is_localized(self, mock_repo):
+        mock_repo.find_cached.return_value = None
+
+        iq = make_inline_query("https://youtu.be/uncached", language_code="ru-RU")
+        await handlers.handle_inline_query(iq)
+
+        assert iq.answer.await_args.kwargs["button"].text == i18n.t("inline.no_cache", "ru")
+
+    async def test_query_without_a_url_is_a_miss_and_never_hits_the_repo(self, mock_repo):
+        iq = make_inline_query("just typing")
+
+        await handlers.handle_inline_query(iq)
+
+        mock_repo.find_cached.assert_not_awaited()
+        assert iq.answer.await_args.args[0] == []
+        assert iq.answer.await_args.kwargs["button"] is not None
+
+    async def test_empty_query_is_a_miss(self, mock_repo):
+        iq = make_inline_query("")
+
+        await handlers.handle_inline_query(iq)
+
+        assert iq.answer.await_args.args[0] == []
+
+    async def test_stories_are_never_served_inline(self, mock_repo):
+        """They expire — a hit would ship content the poster already removed."""
+        iq = make_inline_query("https://instagram.com/stories/someone/123")
+
+        await handlers.handle_inline_query(iq)
+
+        mock_repo.find_cached.assert_not_awaited()
+        assert iq.answer.await_args.args[0] == []
+
+    async def test_repo_failure_degrades_to_a_miss(self, mock_repo):
+        mock_repo.find_cached.side_effect = RuntimeError("db down")
+
+        iq = make_inline_query("https://youtu.be/abc")
+        await handlers.handle_inline_query(iq)  # must not raise
+
+        assert iq.answer.await_args.args[0] == []
+
+    async def test_image_row_without_a_file_id_list_is_a_miss(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row(media_kind="image")
+
+        iq = make_inline_query("https://instagram.com/p/old")
+        await handlers.handle_inline_query(iq)
+
+        assert iq.answer.await_args.args[0] == []
+
+    async def test_hit_is_audited_anonymously(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row()
+
+        iq = make_inline_query("https://youtu.be/abc")
+        await handlers.handle_inline_query(iq)
+
+        create_kwargs = mock_repo.create_request.await_args.kwargs
+        assert create_kwargs["chat_type"] == "inline"
+        assert create_kwargs["url"] == "https://youtu.be/abc"
+        # Nothing identifying, ever — same rule as every other flow.
+        assert not {"user_id", "chat_id", "message_id"} & set(create_kwargs)
+
+        success = mock_repo.mark_success.await_args.kwargs
+        assert success["cache_hit"] is True
+        assert success["media_kind_override"] == "video"
+
+    async def test_audio_hit_is_audited_with_the_audio_kind(self, mock_repo):
+        mock_repo.find_cached.return_value = audio_row()
+
+        await handlers.handle_inline_query(make_inline_query("https://youtu.be/abc"))
+
+        assert mock_repo.mark_success.await_args.kwargs["media_kind_override"] == "audio"
+
+    async def test_a_miss_is_not_audited(self, mock_repo):
+        mock_repo.find_cached.return_value = None
+
+        await handlers.handle_inline_query(make_inline_query("https://youtu.be/x"))
+
+        mock_repo.create_request.assert_not_awaited()
+
+    async def test_audit_failure_never_breaks_the_answer(self, mock_repo):
+        mock_repo.find_cached.return_value = cached_row()
+        mock_repo.create_request.side_effect = RuntimeError("db down")
+
+        iq = make_inline_query("https://youtu.be/abc")
+        await handlers.handle_inline_query(iq)  # must not raise
+
+        assert len(iq.answer.await_args.args[0]) == 1
+
+    async def test_inline_looks_up_all_cacheable_kinds(self, mock_repo):
+        """Unlike the message flows, inline can render every kind — including audio."""
+        mock_repo.find_cached.return_value = None
+
+        await handlers.handle_inline_query(make_inline_query("https://youtu.be/abc"))
+
+        assert "media_kinds" not in mock_repo.find_cached.await_args.kwargs

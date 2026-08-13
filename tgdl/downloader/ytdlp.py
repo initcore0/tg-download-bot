@@ -120,6 +120,7 @@ def build_options(
     playlist_items: str | None = None,
     youtube_clients: tuple[str, ...] = (),
     cookies_file: Path | None = None,
+    format_override: str | None = None,
 ) -> dict[str, Any]:
     """yt-dlp options: quiet, contained inside `workdir`, no writes elsewhere.
 
@@ -127,10 +128,13 @@ def build_options(
     used by the retry loop to dodge client-specific throttling/bot-checks.
     `cookies_file` is resolved per request by `tgdl.downloader.cookies` so each
     platform only ever sees its own jar.
+    `format_override` replaces the video format selector (and its video-oriented
+    format_sort) wholesale — the audio path asks for a bare audio stream and would
+    otherwise inherit a selector that only ever yields video.
     """
     opts: dict[str, Any] = {
-        "format": build_format_selector(max_height),
-        "format_sort": [f"res:{max_height}", "codec:h264", "br"],
+        "format": format_override or build_format_selector(max_height),
+        "format_sort": [] if format_override else [f"res:{max_height}", "codec:h264", "br"],
         "outtmpl": str(workdir / "%(id).60s.%(ext)s"),
         "paths": {"home": str(workdir), "temp": str(workdir)},
         "cachedir": str(workdir / ".ytdlp-cache"),
@@ -150,8 +154,11 @@ def build_options(
         "writeautomaticsub": False,
         "overwrites": True,
         "ignoreerrors": False,
-        "merge_output_format": "mp4",
     }
+    # Only meaningful when a video and an audio stream have to be muxed together;
+    # an audio-only request never merges, and forcing mp4 there just confuses yt-dlp.
+    if not format_override:
+        opts["merge_output_format"] = "mp4"
     if playlist_items is not None:
         opts["playlist_items"] = playlist_items
         opts["noplaylist"] = False
@@ -237,6 +244,7 @@ async def extract(
     download: bool = True,
     max_attempts: int = _MAX_ATTEMPTS,
     cookies_file: Path | None = None,
+    format_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """Download `url` into `workdir`; return one info dict per downloaded item.
 
@@ -244,6 +252,9 @@ async def extract(
     exponential backoff, cycling YouTube player clients between attempts. Permanent
     failures (UnsupportedUrlError / non-transient ExtractionError) raise immediately.
     Never raises a bare exception.
+
+    `format_override` swaps the format selector — the audio path reuses this whole
+    retry ladder rather than growing a second copy of it.
     """
     is_youtube = detect_platform(url) == "youtube"
     last_exc: Exception | None = None
@@ -264,6 +275,7 @@ async def extract(
             playlist_items=playlist_items,
             youtube_clients=clients,
             cookies_file=attempt_cookies,
+            format_override=format_override,
         )
         try:
             info = await asyncio.to_thread(_extract_sync, url, opts, download=download)

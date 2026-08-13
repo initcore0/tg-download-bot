@@ -96,7 +96,11 @@ class TestRun:
         dispatcher.include_router.assert_called_once()
 
         polling_kwargs = dispatcher.start_polling.await_args.kwargs
-        assert polling_kwargs["allowed_updates"] == ["message", "channel_post"]
+        assert polling_kwargs["allowed_updates"] == [
+            "message",
+            "channel_post",
+            "inline_query",
+        ]
 
         # Username cached for mention matching; graceful shutdown ran.
         assert runtime.get_bot_username() == "mybot"
@@ -711,3 +715,155 @@ class TestResponses:
         from tgdl.bot import responses
 
         assert responses.DEFAULT_USERNAME in responses.start_text(None)
+
+    def test_help_mentions_the_audio_command(self):
+        from tgdl.bot import responses
+
+        assert "/mp3" in responses.help_text("mybot")
+        assert "/mp3" in responses.help_text("mybot", "ru")
+
+    def test_start_mentions_the_audio_command(self):
+        from tgdl.bot import responses
+
+        assert "/mp3" in responses.start_text("mybot")
+        assert "/mp3" in responses.start_text("mybot", "ru")
+
+
+STATS_DATA = {
+    "requests": 10,
+    "success": 7,
+    "failed": 2,
+    "pending": 1,
+    "cache_hits": 3,
+    "hit_rate": 3 / 7,
+    "platforms": {
+        "youtube": {"count": 5, "p50_s": 4.2, "p95_s": 19.0},
+        "tiktok": {"count": 2, "p50_s": 1.1, "p95_s": 1.9},
+    },
+}
+
+
+class TestStatsFormatting:
+    """`/stats` is admin-facing English, rendered as an escaped monospace block."""
+
+    def test_includes_counts_and_hit_rate(self):
+        from tgdl.bot import responses
+
+        text = responses.stats_text(STATS_DATA)
+
+        assert "requests   10" in text
+        assert "success    7" in text
+        assert "cache hits 3 (43%)" in text
+
+    def test_includes_the_platform_table(self):
+        from tgdl.bot import responses
+
+        text = responses.stats_text(STATS_DATA)
+
+        assert "youtube" in text and "tiktok" in text
+        assert "4.2s" in text and "19.0s" in text
+
+    def test_wrapped_in_pre_and_html_escaped(self):
+        from tgdl.bot import responses
+
+        text = responses.stats_text(
+            {**STATS_DATA, "platforms": {"<b>evil": {"count": 1, "p50_s": 0.0, "p95_s": 0.0}}}
+        )
+
+        assert text.startswith("<pre>") and text.endswith("</pre>")
+        assert "&lt;b&gt;evil" in text
+
+    def test_empty_platform_table_is_omitted(self):
+        from tgdl.bot import responses
+
+        text = responses.stats_text(
+            {"requests": 0, "success": 0, "failed": 0, "pending": 0,
+             "cache_hits": 0, "hit_rate": 0.0, "platforms": {}}
+        )
+
+        assert "last 30d" not in text
+        assert "requests   0" in text
+
+
+class TestSelfHostedBotApi:
+    """TELEGRAM_API_URL swaps the API server; unset keeps Telegram's cloud API."""
+
+    def _settings(self, **overrides) -> Settings:
+        return Settings(telegram_bot_token="123:ABC", **overrides)
+
+    def test_cloud_api_by_default(self, monkeypatch):
+        bot_cls = MagicMock()
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        main_mod._make_bot(self._settings())
+
+        assert bot_cls.call_args.kwargs["session"] is None
+
+    def test_custom_url_builds_a_session_for_that_server(self, monkeypatch):
+        bot_cls = MagicMock()
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        main_mod._make_bot(self._settings(telegram_api_url="http://local-api:8081"))
+
+        session = bot_cls.call_args.kwargs["session"]
+        assert session is not None
+        # The session must actually address the local server, not api.telegram.org.
+        assert "local-api:8081" in session.api.api_url(token="123:ABC", method="getMe")
+
+    def test_blank_url_is_treated_as_unset(self, monkeypatch):
+        bot_cls = MagicMock()
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        main_mod._make_bot(self._settings(telegram_api_url="   "))
+
+        assert bot_cls.call_args.kwargs["session"] is None
+
+    async def test_run_builds_the_main_bot_through_the_helper(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            database_path=tmp_path / "db.sqlite",
+            telegram_api_url="http://local-api:8081",
+        )
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        bot_cls = MagicMock(return_value=bot)
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock()
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+        await main_mod.run(settings)
+
+        assert bot_cls.call_args.kwargs["session"] is not None
+
+    async def test_healthcheck_uses_the_same_server(self, monkeypatch):
+        """The probe must not check a different API than the bot actually polls."""
+        settings = Settings(
+            telegram_bot_token="123:ABC", telegram_api_url="http://local-api:8081"
+        )
+        bot = MagicMock()
+        bot.get_me = AsyncMock()
+        bot.session.close = AsyncMock()
+        bot_cls = MagicMock(return_value=bot)
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        assert await main_mod._healthcheck(settings) == 0
+        assert bot_cls.call_args.kwargs["session"] is not None
+
+    async def test_healthcheck_uses_the_cloud_api_when_unset(self, monkeypatch):
+        settings = Settings(telegram_bot_token="123:ABC")
+        bot = MagicMock()
+        bot.get_me = AsyncMock()
+        bot.session.close = AsyncMock()
+        bot_cls = MagicMock(return_value=bot)
+        monkeypatch.setattr(main_mod, "Bot", bot_cls)
+
+        assert await main_mod._healthcheck(settings) == 0
+        assert bot_cls.call_args.kwargs["session"] is None

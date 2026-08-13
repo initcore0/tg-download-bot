@@ -37,7 +37,7 @@ _MAX_TITLE = 1000
 #: Kinds that may be replayed from the file_id cache. Videos and animations are single
 #: files, so their `telegram_file_id` is the whole story; images need the full
 #: `telegram_file_ids` list, since replaying a carousel from one id would drop the rest.
-CACHEABLE_MEDIA_KINDS = ("video", "animation", "image")
+CACHEABLE_MEDIA_KINDS = ("video", "animation", "image", "audio")
 
 #: Image rows are only replayable once they carry the full ordered file_id list.
 _LIST_REQUIRED_MEDIA_KINDS = ("image",)
@@ -150,7 +150,10 @@ def decode_file_ids(row: DownloadRequest | Any) -> list[str]:
 
 
 async def find_cached(
-    normalized_url: str, *, max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS
+    normalized_url: str,
+    *,
+    max_age_days: int = DEFAULT_CACHE_MAX_AGE_DAYS,
+    media_kinds: tuple[str, ...] | None = None,
 ) -> DownloadRequest | None:
     """Most recent successful, still-fresh row for `normalized_url` that can be replayed.
 
@@ -159,8 +162,16 @@ async def find_cached(
     list, so a carousel is replayed whole or not at all (see CACHEABLE_MEDIA_KINDS).
     Like `create_request` this may raise — the caller decides how to degrade (the bot
     falls through to a normal download).
+
+    `media_kinds` narrows the eligible kinds (default: all of CACHEABLE_MEDIA_KINDS).
+    A video and an /mp3 audio row share one normalized URL, so each flow must ask only
+    for what it can actually send back.
     """
     if not normalized_url:
+        return None
+
+    kinds = tuple(media_kinds) if media_kinds is not None else CACHEABLE_MEDIA_KINDS
+    if not kinds:
         return None
 
     cutoff = _utcnow() - timedelta(days=max_age_days)
@@ -172,7 +183,7 @@ async def find_cached(
                     DownloadRequest.normalized_url == normalized_url,
                     DownloadRequest.status == "success",
                     DownloadRequest.telegram_file_id.is_not(None),
-                    DownloadRequest.media_kind.in_(CACHEABLE_MEDIA_KINDS),
+                    DownloadRequest.media_kind.in_(kinds),
                     DownloadRequest.created_at >= cutoff,
                     or_(
                         DownloadRequest.media_kind.not_in(_LIST_REQUIRED_MEDIA_KINDS),
@@ -235,12 +246,15 @@ async def mark_success(
     *,
     telegram_file_ids: list[str] | None = None,
     cache_hit: bool = False,
+    media_kind_override: str | None = None,
 ) -> None:
     """Set status='success' plus media metadata. Must swallow+log its own errors.
 
     `telegram_file_ids` is every file_id sent for this request, in order — a carousel
     needs all of them to be replayable. `telegram_file_id` stays the first one.
     `cache_hit` marks a row that was served from the cache instead of downloaded.
+    `media_kind_override` records a kind the frozen `MediaResult.kind` Literal cannot
+    express — the /mp3 flow passes "audio" rather than mislabeling its row as video.
     """
     try:
         async with _session() as session, session.begin():
@@ -250,7 +264,7 @@ async def mark_success(
                 return
 
             request.status = "success"
-            request.media_kind = media.kind
+            request.media_kind = media_kind_override or media.kind
             request.title = _truncate(media.title, _MAX_TITLE)
             request.filesize_bytes = media.filesize
             request.duration_s = media.duration_s
@@ -287,19 +301,87 @@ async def mark_failure(request_id: int, error: BaseException, elapsed_s: float) 
         logger.exception("Failed to record failure for request %s", request_id)
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile of an already-sorted `values` list.
+
+    SQLite has no percentile function, so the latency values are fetched (bounded by
+    STATS_LATENCY_SAMPLE_LIMIT) and ranked here. Nearest rank keeps it exact and
+    obvious: p50 of 4 samples is the 2nd, p95 of 20 is the 19th — no interpolation to
+    reason about when reading a /stats reply.
+    """
+    if not values:
+        return 0.0
+    rank = max(1, -(-len(values) * fraction // 1))  # ceil, integer arithmetic
+    return values[min(int(rank), len(values)) - 1]
+
+
+#: Rows in the platform breakdown, and how many latency samples per platform we are
+#: willing to pull into memory. /stats is an ops glance, not an analytics warehouse.
+STATS_PLATFORM_WINDOW_DAYS = 30
+STATS_LATENCY_SAMPLE_LIMIT = 5000
+
+
 async def stats() -> dict[str, Any]:
-    """Small helper for ops: total/succeeded/failed requests (no user counts exist)."""
+    """Ops summary: request counts, cache hit rate, and per-platform latency.
+
+    Adds to the raw status counts: `cache_hits` / `hit_rate` (how often a link came
+    straight back from the file_id cache) and a `platforms` breakdown of successful
+    requests from the last 30 days — count plus p50/p95 elapsed seconds each, which is
+    what tells you whether one platform has quietly gotten slow.
+    """
+    cutoff = _utcnow() - timedelta(days=STATS_PLATFORM_WINDOW_DAYS)
     async with _session() as session:
         rows = (
             await session.execute(
                 select(DownloadRequest.status, func.count()).group_by(DownloadRequest.status)
             )
         ).all()
+        cache_hits = (
+            await session.execute(
+                select(func.count()).where(
+                    DownloadRequest.status == "success",
+                    DownloadRequest.cache_hit.is_(True),
+                )
+            )
+        ).scalar_one()
+        # Percentiles are computed in Python (SQLite has no percentile function), so
+        # the sample is bounded — a very old, very large audit table must not be
+        # loaded whole just to answer a status command.
+        samples = (
+            await session.execute(
+                select(DownloadRequest.platform, DownloadRequest.elapsed_s)
+                .where(
+                    DownloadRequest.status == "success",
+                    DownloadRequest.created_at >= cutoff,
+                    DownloadRequest.elapsed_s.is_not(None),
+                )
+                .order_by(DownloadRequest.created_at.desc())
+                .limit(STATS_LATENCY_SAMPLE_LIMIT)
+            )
+        ).all()
 
     by_status = {status: count for status, count in rows}
+    success = by_status.get("success", 0)
+
+    by_platform: dict[str, list[float]] = {}
+    for platform, elapsed in samples:
+        by_platform.setdefault(platform or "other", []).append(float(elapsed))
+
+    platforms = {}
+    for platform, values in sorted(by_platform.items(), key=lambda kv: -len(kv[1])):
+        values.sort()
+        platforms[platform] = {
+            "count": len(values),
+            "p50_s": _percentile(values, 0.50),
+            "p95_s": _percentile(values, 0.95),
+        }
+
     return {
         "requests": sum(by_status.values()),
         "pending": by_status.get("pending", 0),
-        "success": by_status.get("success", 0),
+        "success": success,
         "failed": by_status.get("failed", 0),
+        "cache_hits": cache_hits,
+        "hit_rate": (cache_hits / success) if success else 0.0,
+        "platforms": platforms,
     }

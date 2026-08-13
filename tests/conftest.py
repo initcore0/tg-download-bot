@@ -149,6 +149,36 @@ def gif_file(media_dir: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def aac_m4a(media_dir: Path) -> Path:
+    """2s AAC-in-m4a — exactly what /mp3 wants; must be sent untouched."""
+    out = media_dir / "audio_aac.m4a"
+    if not out.exists():
+        _run_ffmpeg(
+            [
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:a", "aac", "-b:a", "64k",
+                str(out),
+            ]
+        )
+    return out
+
+
+@pytest.fixture(scope="session")
+def opus_webm(media_dir: Path) -> Path:
+    """2s Opus-in-WebM audio — must be converted to m4a for Telegram."""
+    out = media_dir / "audio_opus.webm"
+    if not out.exists():
+        _run_ffmpeg(
+            [
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:a", "libopus", "-b:a", "48k",
+                str(out),
+            ]
+        )
+    return out
+
+
+@pytest.fixture(scope="session")
 def jpg_file(media_dir: Path) -> Path:
     out = media_dir / "still.jpg"
     if not out.exists():

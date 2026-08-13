@@ -26,8 +26,8 @@ the resulting Telegram `file_id` — which powers the re-send-without-re-downloa
    "Video too large"), timeouts, and cleanup of temp files.
 4. **Audit everything.** Users + requests + outcomes in SQLite.
 
-Non-goals (explicitly): playlists, audio-only extraction, quality selection UI, rate
-limiting beyond a concurrency cap, ads/branding.
+Non-goals (explicitly): playlists, quality selection UI, rate limiting beyond a
+concurrency cap, ads/branding.
 
 ## 3. Stack
 
@@ -78,6 +78,10 @@ Telegram update
           cache_hit) or mark_failure(request, error).
       11. Delete workdir (always, in finally).
 ```
+
+`/mp3 <link>` runs the same eleven steps against the audio pipeline (§5.6) with its
+own cache and coalescing keys. An **inline query** (§7.1) is the one flow that skips
+all of it: it answers from the cache or not at all.
 
 ## 5. Downloader pipeline (`tgdl/downloader/`)
 
@@ -172,6 +176,38 @@ when an anonymous attempt hits a login wall. Each jar is set either as env-var
 `*_FILE` path; content wins over path. Both engines receive the resolved jar
 per-request (`cookies_file=` parameter), not via global state.
 
+### 5.6 Audio path (`tgdl/downloader/audio.py`) — `/mp3`
+
+`/mp3 <link>` (alias `/audio`) returns the sound track alone, as a Telegram audio
+message with title and duration. It is a separate, smaller pipeline:
+
+```python
+async def download_audio(
+    url: str, workdir: Path, *, max_size_bytes: int, timeout_s: int,
+) -> AudioResult      # path, title, duration_s, filesize, performer
+```
+
+- **Format**: `ba[ext=m4a]/bestaudio`, passed to `ytdlp.extract` via its
+  `format_override` parameter — the audio path reuses the whole retry ladder
+  (backoff, YouTube client cycling, cookie routing) rather than duplicating it.
+- **The command is /mp3; the payload is m4a.** Telegram plays m4a natively and almost
+  every source already carries an AAC track, so m4a means a stream copy where mp3
+  would mean a re-encode on every request. An `ba[ext=m4a]` hit is sent untouched;
+  anything else goes through `transcode.to_m4a`, which itself copies an AAC stream
+  (`-c:a copy`) and only encodes (AAC 128k) when it must.
+- **Errors**: identical taxonomy, SSRF guard, and `asyncio.timeout` wrapper as
+  `download_media`. No size-retry ladder — an audio track over the cap is a
+  `MediaTooLargeError`, since re-encoding an already-small stream buys little.
+- **Not a `MediaResult`.** `models.py` is frozen and its `MediaKind` Literal has no
+  `"audio"`, so audio carries its own `AudioResult` dataclass. The audit row still
+  needs the right kind, so `repo.mark_success` takes an optional
+  `media_kind_override` which the bot sets to `"audio"`.
+- **Cache and coalescing are keyed apart from video.** The same link now produces both
+  a video row and an audio row, so `repo.find_cached` takes an optional `media_kinds`
+  filter (the video flow asks for video/animation/image, `/mp3` asks for audio only)
+  and the audio coalescing key is prefixed `audio:`. Neither flow can ever be served
+  the other's file_id.
+
 ## 6. Storage / audit (`tgdl/storage/`)
 
 SQLite at `DATABASE_PATH` (default `data/tgdl.db`), WAL mode. Table created on startup
@@ -258,8 +294,9 @@ Neither can block startup: both are wrapped, log, and continue.
 ## 7. Bot layer (`tgdl/bot/`)
 
 - Long polling via aiogram Dispatcher; single process.
-- Handlers: `/start`, `/help` (short usage text), private-message URL handler,
-  group/channel mention handler (`message` + `channel_post` updates).
+- Handlers: `/start`, `/help` (short usage text), `/mp3` (alias `/audio`, §5.6),
+  `/stats` (admin, §7.2), private-message URL handler, group/channel mention handler,
+  and an inline-query handler (`message` + `channel_post` + `inline_query` updates).
 - Upload via `FSInputFile`; `sendVideo(width, height, duration, supports_streaming=True)`.
 - Store every returned file_id into the audit row (`telegram_file_ids`, with the first
   also in `telegram_file_id`) — that write is what populates the §6.1 cache for the next
@@ -275,6 +312,37 @@ Neither can block startup: both are wrapped, log, and continue.
 and never stored, so it doesn't affect anonymity. All user-facing strings live in one
 catalog keyed by message id. The downloader is language-agnostic: each `DownloadError`
 carries a stable `message_key`, and the bot translates it at send time.
+
+### 7.1 Inline mode (cache hits only)
+
+`@botname <link>` in any chat answers from the §6.1 file_id cache and never downloads.
+Telegram gives an inline query a few seconds and no way to show progress, so starting
+a download there would time out and read as broken. Must be enabled once via BotFather
+(`/setinline`).
+
+- **Hit**: the cached row is answered as `InlineQueryResultCachedVideo` /
+  `CachedMpeg4Gif` / `CachedPhoto` / `CachedAudio` from the stored file_id(s). Inline
+  has no media groups, so a gallery row becomes up to 10 separate photo results
+  (ids are `<row id>-<index>`, unique within the answer). `cache_time=300`.
+- **Miss** (or no URL in the query): zero results plus an
+  `InlineQueryResultsButton` into private chat — "send me the link here first" —
+  where the normal flow warms the cache for everyone. `cache_time=30`.
+- `is_personal=False` throughout: the answer depends only on the link, never on who
+  asked, which is both true and consistent with the anonymity design.
+- Hits are audited with `chat_type="inline"` and `cache_hit=True`. An inline query
+  carries no chat, and nothing identifying is recorded — same rule as everywhere else.
+
+### 7.2 `/stats` (admin)
+
+An ops readout: request/success/failure counts, cache hit rate, and a per-platform
+p50/p95 latency table for the last 30 days (percentiles computed in Python by nearest
+rank — SQLite has none — over a bounded sample). Replies as an escaped `<pre>` block,
+in English only: it is an ops surface, not a user reply.
+
+Gated on **both** a private chat and `message.from_user.id == ADMIN_USER_ID` (0 =
+disabled). Every other case does nothing at all — not even an error — so the command's
+existence isn't advertised. The admin id is compared in memory and never stored, so §6's
+anonymity guarantee is untouched.
 
 ## 8. Config (env / `.env` — see `.env.example`)
 
@@ -294,7 +362,28 @@ INSTAGRAM_COOKIES    same, used only for Instagram (stories + login-wall retry;
 COOKIES              same, generic jar for platforms without a dedicated one
 *_COOKIES_FILE       file-path variant of each jar (COOKIES_FILE,
                      YOUTUBE_COOKIES_FILE, INSTAGRAM_COOKIES_FILE); content wins
+ADMIN_USER_ID        default 0 (disabled) — the only id allowed to run /stats (§7.2)
+TELEGRAM_API_URL     default "" (Telegram's cloud API) — see §8.1
 ```
+
+### 8.1 Self-hosted Bot API server
+
+The 50 MB cap behind `MAX_FILE_SIZE_MB=48` is Telegram's *cloud* Bot API limit, not
+ours. Running a `telegram-bot-api` server raises it to 2 GB. Setting
+`TELEGRAM_API_URL` makes `main._make_bot` build the Bot with
+`AiohttpSession(api=TelegramAPIServer.from_base(url))`; empty (the default) keeps the
+cloud API and today's behavior. Every Bot in the process — the polling bot and the
+`--healthcheck` probe — is constructed through that one helper so they cannot end up
+pointed at different servers.
+
+`docker-compose.yml` carries the server under the `local-api` profile, so a plain
+`docker compose up` never starts it; opting in is `docker compose --profile local-api
+up -d` plus `TELEGRAM_API_URL` (and `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from
+my.telegram.org). `MAX_FILE_SIZE_MB` can then be raised (e.g. 1500).
+
+One-time caveat, documented in `.env.example` and deliberately **not** automated: a
+token already used against the cloud API must be released with a single `logOut` call
+to the cloud API before a local server will accept it.
 
 ## 9. Module ownership & boundaries (for parallel build agents)
 

@@ -522,6 +522,9 @@ async def test_stats_on_empty_db(db_path: Path):
         "pending": 0,
         "success": 0,
         "failed": 0,
+        "cache_hits": 0,
+        "hit_rate": 0.0,
+        "platforms": {},
     }
 
 
@@ -533,12 +536,80 @@ async def test_stats_counts(db_path: Path):
     await repo.mark_success(ok.id, make_media(), "fid", 1.0)
     await repo.mark_failure(bad.id, RuntimeError("nope"), 1.0)
 
-    assert await repo.stats() == {
-        "requests": 3,
-        "pending": 1,
-        "success": 1,
-        "failed": 1,
-    }
+    data = await repo.stats()
+    assert data["requests"] == 3
+    assert data["pending"] == 1
+    assert data["success"] == 1
+    assert data["failed"] == 1
+
+
+async def test_stats_hit_rate(db_path: Path):
+    """cache_hits / success — the metric §6.1 was built to make possible."""
+    for _ in range(3):
+        row = await new_request()
+        await repo.mark_success(row.id, make_media(), "fid", 1.0)
+    hit = await new_request()
+    await repo.mark_success(hit.id, make_media(), "fid", 0.1, cache_hit=True)
+
+    data = await repo.stats()
+
+    assert data["success"] == 4
+    assert data["cache_hits"] == 1
+    assert data["hit_rate"] == pytest.approx(0.25)
+
+
+async def test_stats_hit_rate_is_zero_when_nothing_succeeded(db_path: Path):
+    bad = await new_request()
+    await repo.mark_failure(bad.id, RuntimeError("nope"), 1.0)
+
+    data = await repo.stats()
+
+    assert data["success"] == 0
+    assert data["hit_rate"] == 0.0  # guarded, not a ZeroDivisionError
+
+
+async def test_stats_platform_percentiles_use_nearest_rank(db_path: Path):
+    """p50 of 4 samples is the 2nd value, p95 the 4th — no interpolation."""
+    for elapsed in (1.0, 2.0, 3.0, 40.0):
+        row = await new_request()
+        await repo.mark_success(row.id, make_media(), "fid", elapsed)
+
+    entry = (await repo.stats())["platforms"]["youtube"]
+
+    assert entry["count"] == 4
+    assert entry["p50_s"] == pytest.approx(2.0)
+    assert entry["p95_s"] == pytest.approx(40.0)
+
+
+async def test_stats_platforms_are_separated(db_path: Path):
+    yt = await new_request()
+    await repo.mark_success(yt.id, make_media(), "fid", 5.0)
+    tt = await new_request(platform="tiktok", normalized_url="https://tiktok.com/v/1")
+    await repo.mark_success(tt.id, make_media(platform="tiktok"), "fid", 1.0)
+
+    platforms = (await repo.stats())["platforms"]
+
+    assert platforms["youtube"]["p50_s"] == pytest.approx(5.0)
+    assert platforms["tiktok"]["p50_s"] == pytest.approx(1.0)
+
+
+async def test_stats_platforms_exclude_failures_and_old_rows(db_path: Path):
+    bad = await new_request()
+    await repo.mark_failure(bad.id, RuntimeError("nope"), 9.0)
+    old = await new_request()
+    await repo.mark_success(old.id, make_media(), "fid", 9.0)
+    await _age_request(old.id, days=repo.STATS_PLATFORM_WINDOW_DAYS + 1)
+
+    assert (await repo.stats())["platforms"] == {}
+
+
+def test_percentile_nearest_rank_edges():
+    assert repo._percentile([], 0.5) == 0.0
+    assert repo._percentile([7.0], 0.95) == 7.0
+    # 20 samples: p95 -> rank 19 (the 19th smallest), p50 -> rank 10.
+    values = [float(i) for i in range(1, 21)]
+    assert repo._percentile(values, 0.95) == 19.0
+    assert repo._percentile(values, 0.50) == 10.0
 
 
 # ------------------------------------------------------------------ file_id cache
@@ -696,6 +767,70 @@ async def test_find_cached_file_id_misses_on_different_url(db_path: Path):
 
     assert await repo.find_cached_file_id("https://youtube.com/watch?v=other") is None
     assert await repo.find_cached_file_id("") is None
+
+
+# ------------------------------------------------------- audio rows & kind filter
+
+
+async def test_mark_success_records_the_media_kind_override(db_path: Path):
+    """models.MediaKind has no "audio", so /mp3 rows get their kind explicitly."""
+    request = await new_request()
+
+    await repo.mark_success(
+        request.id, make_media(), "fid-audio", 1.0, media_kind_override="audio"
+    )
+
+    async with repo._session() as session:
+        stored = await session.get(DownloadRequest, request.id)
+    assert stored.media_kind == "audio"
+    # Everything else still comes from the MediaResult.
+    assert stored.title == "A test video"
+
+
+async def test_mark_success_without_an_override_uses_the_media_kind(db_path: Path):
+    request = await new_request()
+
+    await repo.mark_success(request.id, make_media(kind="animation"), "fid", 1.0)
+
+    async with repo._session() as session:
+        stored = await session.get(DownloadRequest, request.id)
+    assert stored.media_kind == "animation"
+
+
+async def test_find_cached_filters_by_media_kind(db_path: Path):
+    """A video and an /mp3 row share one URL; neither may stand in for the other."""
+    video = await new_request()
+    await repo.mark_success(video.id, make_media(), "fid-video", 1.0)
+    audio = await new_request()
+    await repo.mark_success(
+        audio.id, make_media(), "fid-audio", 1.0, media_kind_override="audio"
+    )
+    url = "https://youtube.com/watch?v=abc"
+
+    audio_row = await repo.find_cached(url, media_kinds=("audio",))
+    video_row = await repo.find_cached(url, media_kinds=("video", "animation", "image"))
+
+    assert audio_row.telegram_file_id == "fid-audio"
+    assert video_row.telegram_file_id == "fid-video"
+
+
+async def test_find_cached_without_a_filter_accepts_audio(db_path: Path):
+    """Inline mode can render every cacheable kind, so it passes no filter."""
+    request = await new_request()
+    await repo.mark_success(
+        request.id, make_media(), "fid-audio", 1.0, media_kind_override="audio"
+    )
+
+    row = await repo.find_cached("https://youtube.com/watch?v=abc")
+
+    assert row is not None and row.media_kind == "audio"
+
+
+async def test_find_cached_with_an_empty_filter_matches_nothing(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid", 1.0)
+
+    assert await repo.find_cached("https://youtube.com/watch?v=abc", media_kinds=()) is None
 
 
 # --------------------------------------------------------------- audit retention

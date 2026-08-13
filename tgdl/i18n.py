@@ -23,6 +23,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
             "back — no captions, no watermarks, ready to forward.\n\n"
             "Works with YouTube, TikTok, Instagram, X/Twitter, Twitch clips, Pinterest "
             "and many more.\n\n"
+            "Want just the sound? Send <code>/mp3 &lt;link&gt;</code>.\n\n"
             "In a group, mention me with the link: <code>@{username} &lt;link&gt;</code>"
         ),
         "ru": (
@@ -30,6 +31,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
             "— без подписей, без водяных знаков, готовое к пересылке.\n\n"
             "Работает с YouTube, TikTok, Instagram, X/Twitter, клипами Twitch, Pinterest "
             "и многими другими.\n\n"
+            "Нужен только звук? Пришли <code>/mp3 &lt;ссылка&gt;</code>.\n\n"
             "В группе упомяни меня вместе со ссылкой: <code>@{username} &lt;ссылка&gt;</code>"
         ),
     },
@@ -41,7 +43,9 @@ _MESSAGES: dict[str, dict[str, str]] = {
             "(<code>@{username} &lt;link&gt;</code>).\n\n"
             "I grab the media at up to 720p and under 48 MB, then send it back as plain "
             "video or photo.\n\n"
-            "Commands: /start, /help"
+            "• <b>Audio only</b>: <code>/mp3 &lt;link&gt;</code> sends just the sound "
+            "track (works in groups too, no mention needed).\n\n"
+            "Commands: /start, /help, /mp3"
         ),
         "ru": (
             "📥 <b>Как мной пользоваться</b>\n\n"
@@ -50,8 +54,18 @@ _MESSAGES: dict[str, dict[str, str]] = {
             "(<code>@{username} &lt;ссылка&gt;</code>).\n\n"
             "Я скачиваю медиа в качестве до 720p и размером до 48 МБ, затем отправляю "
             "обратно как обычное видео или фото.\n\n"
-            "Команды: /start, /help"
+            "• <b>Только звук</b>: <code>/mp3 &lt;ссылка&gt;</code> пришлёт только "
+            "звуковую дорожку (работает и в группах, упоминание не нужно).\n\n"
+            "Команды: /start, /help, /mp3"
         ),
+    },
+    "usage.mp3": {
+        "en": "🎵 Send /mp3 followed by a link.",
+        "ru": "🎵 Пришли /mp3 и ссылку следом.",
+    },
+    "inline.no_cache": {
+        "en": "No cached copy yet — send me the link here first",
+        "ru": "В кэше пока пусто — сначала пришли мне ссылку сюда",
     },
     "busy_per_user": {
         "en": "⏳ I'm still working on your previous link — please wait for it to finish.",
