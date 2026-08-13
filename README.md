@@ -18,10 +18,17 @@ media, makes it Telegram-compatible, and sends it straight back.
   stream-copy instead of re-encoding; capped at 720p. Transcoding is a fallback, not the norm.
 - **Plain output.** No captions, no links, no watermarks, no branding — the media arrives
   clean and ready to forward.
+- **Audio only, on request.** `/mp3 <link>` (alias `/audio`) sends just the sound track,
+  as a Telegram audio message with title and duration. Works in groups too, no mention
+  needed. The payload is m4a — Telegram plays it natively, and it avoids a pointless
+  re-encode on the majority of links that already carry an AAC track.
 - **Size-aware.** Enforces Telegram's bot upload limit (48 MB cap) with one automatic 480p
-  compression retry before giving up with a clear message.
+  compression retry before giving up with a clear message. Raise it to ~2 GB by pointing
+  the bot at a [self-hosted Bot API server](#self-hosted-bot-api-server-2-gb-uploads).
 - **Works in private chats, groups, and channels.** Private chats process any supported URL;
   groups and channels respond to `@yourbotname <link>` mentions.
+- **Inline mode.** Type `@yourbotname <link>` in any chat to re-send something already in
+  the cache, without leaving the conversation (see [Inline mode](#inline-mode)).
 - **Clear errors.** Unsupported links, private/deleted media, oversized videos, and timeouts
   all produce a specific user-facing message.
 - **Bilingual (English + Russian).** Replies, help, and error messages are shown in Russian
@@ -62,6 +69,37 @@ will silently not work in groups. Disable privacy mode:
 
 The bot must be added to the channel as an **administrator** to receive `channel_post`
 updates. Trigger it there the same way: `@yourbotname <link>`.
+
+### For inline mode: enable it once
+
+Inline mode is off by default. Send `/setinline` to BotFather, select your bot, and give
+it a placeholder (e.g. `paste a link…`). See [Inline mode](#inline-mode) for what it does.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/start`, `/help` | Usage text, in the user's language. |
+| `/mp3 <link>` (`/audio`) | Sends the audio track only. Works in private chats **and groups** — an explicit command needs no mention. |
+| `/stats` | Ops summary for the configured admin (`ADMIN_USER_ID`) in private chat. Silently does nothing for anyone else. |
+
+Everything else is just a link: send one in private, or `@yourbotname <link>` in a group
+or channel.
+
+## Inline mode
+
+Type `@yourbotname <link>` in **any** chat — including chats the bot isn't in — and pick
+the result to send the media inline.
+
+Inline serves the `file_id` cache **only**: it re-sends links the bot has already
+downloaded for someone, which costs one API call and is instant. Telegram gives an inline
+query a few seconds and no way to show progress, so downloading there would simply time
+out. When a link isn't cached yet, the result list is empty and offers a button into
+private chat — send it there once, and it is available inline from then on (for everyone;
+the cache is not per-user).
+
+Image carousels come back as up to 10 individual photo results, since inline mode has no
+albums. Instagram stories are never cached, so they are never served inline either.
 
 ## Running locally
 
@@ -123,7 +161,38 @@ All settings are read from the environment or a `.env` file. Only the token is r
 | `INSTAGRAM_COOKIES` | — | cookies.txt content used **only for Instagram**: stories, plus one automatic retry when a post is login-walled. Public reels/posts stay anonymous so the account isn't flagged. |
 | `COOKIES` | — | Generic cookies.txt content for platforms without a dedicated jar above. |
 | `*_COOKIES_FILE` | — | File-path variant of each of the three jars (`COOKIES_FILE`, `YOUTUBE_COOKIES_FILE`, `INSTAGRAM_COOKIES_FILE`); content vars win when both are set. |
+| `ADMIN_USER_ID` | `0` | Telegram user id allowed to run `/stats`. `0` disables the command. Compared in memory only — never stored. |
+| `TELEGRAM_API_URL` | — | Base URL of a self-hosted Bot API server (see below). Empty = Telegram's cloud API. |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | — | Credentials from [my.telegram.org](https://my.telegram.org), used by the self-hosted server container only. |
 | `LOG_LEVEL` | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, …). |
+
+### Self-hosted Bot API server (2 GB uploads)
+
+Telegram's cloud Bot API refuses uploads over 50 MB — that is where the 48 MB cap comes
+from. Running your own [`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api)
+server raises the limit to 2 GB:
+
+1. Get an **API ID** and **API hash** from [my.telegram.org](https://my.telegram.org)
+   (API development tools). These identify the server and are separate from your bot token.
+2. Release the token from the cloud API — **one time, and only if the token has already
+   been used against it**. The local server will otherwise reject it:
+   ```bash
+   curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/logOut"
+   ```
+   This is deliberately not automated: it is irreversible for the current session.
+   See the [logOut docs](https://core.telegram.org/bots/api#logout).
+3. Start the server and point the bot at it:
+   ```bash
+   docker compose --profile local-api up -d
+   ```
+   ```dotenv
+   TELEGRAM_API_URL=http://telegram-bot-api:8081
+   MAX_FILE_SIZE_MB=1500
+   ```
+
+The server runs behind a compose profile, so a plain `docker compose up` never starts it
+and existing deployments are unaffected. Leaving `TELEGRAM_API_URL` unset keeps the cloud
+API and today's behavior exactly.
 
 ### YouTube "Sign in to confirm you're not a bot"
 
@@ -150,8 +219,12 @@ table, and the audit database contains no Telegram user id, username, real name,
 or message id — nothing that identifies a person or ties requests back to one.
 
 The Telegram user id is used only *in memory*, and only for the per-user concurrency guard
-(so one user can't monopolize the download slots). It exists for the lifetime of a download
-and is never written to disk.
+(so one user can't monopolize the download slots) and the `ADMIN_USER_ID` comparison behind
+`/stats`. It exists for the lifetime of a download and is never written to disk.
+
+Inline queries follow the same rule: a hit is audited with the coarse `chat_type="inline"`
+and nothing else, and inline results are identical for every user (`is_personal=False`),
+because nothing about them depends on who asked.
 
 If you are upgrading a database from an earlier version that *did* store identifying data,
 no action is needed: on startup the bot automatically drops the old `users` table and the

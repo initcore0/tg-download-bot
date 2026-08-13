@@ -18,5 +18,24 @@ services:
       - tgdl-data:/app/data
     restart: unless-stopped
 
+  # Optional self-hosted Bot API server: raises the upload cap from 50 MB to 2 GB.
+  # Behind a profile so a plain `docker compose up` never starts it — run
+  # `docker compose --profile local-api up -d` and point the bot at it by setting
+  # TELEGRAM_API_URL=http://telegram-bot-api:8081 (see .env.example, including the
+  # one-time logOut caveat for a token that has already run against the cloud API).
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tgdl-bot-api
+    profiles: ["local-api"]
+    environment:
+      # Both from https://my.telegram.org (API development tools) — the server
+      # refuses to start without them.
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    volumes:
+      - tgdl-bot-api-data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
 volumes:
   tgdl-data:
+  tgdl-bot-api-data:

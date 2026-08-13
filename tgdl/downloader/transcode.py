@@ -356,6 +356,38 @@ def target_audio_bitrate(max_size_bytes: int, duration_s: float) -> int:
     return _MIN_AUDIO_BITRATE_BPS
 
 
+async def to_m4a(
+    src: Path, dst: Path | None = None, *, audio_bitrate: int = _AUDIO_BITRATE_BPS
+) -> Path:
+    """Extract `src`'s audio into an M4A Telegram plays natively.
+
+    Latency policy applies here too: an AAC source is stream-copied (`-c:a copy`, ~1s
+    and bit-identical), anything else is encoded to AAC. Video streams are dropped
+    either way — this is the /mp3 payload, not a music video.
+    """
+    dst = dst or _output_path(src, "_audio", ext=".m4a")
+    info = await probe(src)
+    copy_ok = info.audio_codec in _OK_AUDIO_CODECS
+
+    args = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(src),
+        "-vn",
+    ]
+    if copy_ok:
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", "aac", "-b:a", f"{audio_bitrate // 1000}k"]
+    args += ["-movflags", "+faststart", str(dst)]
+
+    code, _, stderr = await _run(args, what="ffmpeg audio extract")
+    if code != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise TranscodeError(
+            f"audio extraction failed for {src.name}: {stderr.decode(errors='replace')[:500]}"
+        )
+    return dst
+
+
 async def convert_image(src: Path, dst: Path | None = None) -> Path:
     """Convert an image (e.g. webp) to JPEG for maximum Telegram compatibility."""
     dst = dst or _output_path(src, "_conv", ext=".jpg")

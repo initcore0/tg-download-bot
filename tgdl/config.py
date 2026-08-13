@@ -8,6 +8,17 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     telegram_bot_token: str = ""
+
+    # Base URL of a self-hosted Bot API server (`telegram-bot-api`). Empty means
+    # Telegram's cloud API, which caps uploads at 50 MB; a local server raises that
+    # to 2 GB, so MAX_FILE_SIZE_MB can be raised alongside it. See .env.example for
+    # the one-time logOut caveat when reusing a token that ran against the cloud API.
+    telegram_api_url: str = ""
+
+    # Telegram user id allowed to run /stats. 0 disables the command entirely. Only
+    # ever compared in memory — never stored, so the audit stays anonymous.
+    admin_user_id: int = 0
+
     database_path: Path = Path("data/tgdl.db")
     download_dir: Path = Path("data/downloads")
     max_file_size_mb: int = 48

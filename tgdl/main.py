@@ -18,6 +18,8 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramUnauthorizedError
 from sqlalchemy.exc import OperationalError
@@ -29,8 +31,9 @@ from tgdl.storage import repo
 
 log = logging.getLogger("tgdl")
 
-#: We only ever need these two update types (ARCHITECTURE.md §7).
-ALLOWED_UPDATES = ["message", "channel_post"]
+#: The update types we act on (ARCHITECTURE.md §7). `inline_query` serves cache hits
+#: only and must also be enabled once via BotFather (/setinline).
+ALLOWED_UPDATES = ["message", "channel_post", "inline_query"]
 
 #: A workdir is only swept once it is this many times older than the download timeout,
 #: so a download running at the moment we start up is never pulled out from under it.
@@ -171,6 +174,22 @@ async def check_ytdlp_freshness() -> None:
         log.debug("yt-dlp freshness check failed; skipping", exc_info=True)
 
 
+def _make_bot(settings: Settings, *, default: DefaultBotProperties | None = None) -> Bot:
+    """Build a Bot pointed at either Telegram's cloud API or a self-hosted server.
+
+    `TELEGRAM_API_URL` opts into a local `telegram-bot-api` instance, whose upload
+    limit is 2 GB instead of the cloud's 50 MB (see .env.example / ARCHITECTURE.md §8).
+    Every Bot in the process goes through here so the main bot and the healthcheck
+    can't end up talking to different servers.
+    """
+    api_url = settings.telegram_api_url.strip()
+    session = None
+    if api_url:
+        session = AiohttpSession(api=TelegramAPIServer.from_base(api_url))
+        log.info("using self-hosted Bot API server at %s", api_url)
+    return Bot(token=settings.telegram_bot_token, session=session, default=default)
+
+
 async def _resolve_username(bot: Bot) -> str | None:
     """Cache the bot's @username so group/channel mention matching works."""
     try:
@@ -238,10 +257,7 @@ async def run(settings: Settings) -> None:
 
     sweep_orphan_workdirs(settings.download_dir, settings.download_timeout_s)
 
-    bot = Bot(
-        token=settings.telegram_bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = _make_bot(settings, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(handlers.router)
 
@@ -285,7 +301,7 @@ async def run(settings: Settings) -> None:
 
 async def _healthcheck(settings: Settings) -> int:
     """Liveness probe: confirm the token/network are working via getMe. 0 = healthy."""
-    bot = Bot(token=settings.telegram_bot_token)
+    bot = _make_bot(settings)
     try:
         await bot.get_me()
         return 0
