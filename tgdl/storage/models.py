@@ -8,7 +8,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Index, Integer, String
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -81,8 +91,20 @@ class DownloadRequest(Base):
     height: Mapped[int | None] = mapped_column(Integer, default=None)
     transcoded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    # Future dedup/cache key: re-send by file_id instead of re-downloading.
+    # Dedup/cache key: re-send by file_id instead of re-downloading (§6.1).
     telegram_file_id: Mapped[str | None] = mapped_column(String(256), default=None)
+
+    # Every file_id we sent for this request, in order, JSON-encoded. A carousel needs
+    # all of them to be replayable; `telegram_file_id` above stays the first item so
+    # older readers keep working.
+    telegram_file_ids: Mapped[str | None] = mapped_column(Text, default=None)
+
+    # True when this request was served from the cache rather than downloaded — the
+    # raw material for a hit-rate metric. `server_default` is what lets the additive
+    # migration ADD this NOT NULL column to a table that already has rows.
+    cache_hit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         TZDateTime, default=utcnow, nullable=False

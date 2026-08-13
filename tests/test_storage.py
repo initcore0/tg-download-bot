@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import inspect
@@ -261,6 +262,87 @@ async def test_startup_repairs_dangling_user_id_fk(tmp_path: Path):
     assert row == ("private", "https://youtube.com/watch?v=abc", "success")
 
 
+# ------------------------------------------------- additive column migration
+
+#: An anonymous-era `requests` table from before the cache columns existed. It is
+#: already clean of identifying data, so only the ADD COLUMN pass has work to do.
+_PRE_CACHE_COLUMNS_SCHEMA = """
+    CREATE TABLE requests (
+        id INTEGER PRIMARY KEY,
+        chat_type TEXT NOT NULL,
+        url TEXT NOT NULL, normalized_url TEXT, platform TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_class TEXT, error_message TEXT,
+        media_kind TEXT, title TEXT, filesize_bytes BIGINT,
+        duration_s FLOAT, width INTEGER, height INTEGER,
+        transcoded BOOLEAN NOT NULL DEFAULT 0,
+        telegram_file_id TEXT,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME, elapsed_s FLOAT
+    );
+    INSERT INTO requests (chat_type, url, normalized_url, status, media_kind,
+                          telegram_file_id)
+    VALUES ('private', 'https://youtube.com/watch?v=old',
+            'https://youtube.com/watch?v=old', 'success', 'video', 'old-fid');
+"""
+
+
+async def test_startup_adds_missing_cache_columns(tmp_path: Path):
+    """An old DB gains the new columns on init, keeping every existing row."""
+    path = tmp_path / "pre-cache.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_PRE_CACHE_COLUMNS_SCHEMA)
+
+    await repo.init_db(path)
+    try:
+        async with repo._session() as session:
+            conn = await session.connection()
+            columns = await conn.run_sync(
+                lambda c: {col["name"] for col in inspect(c).get_columns("requests")}
+            )
+        # The migrated DB is fully writable, new columns included.
+        request = await new_request()
+        await repo.mark_success(
+            request.id, make_media(kind="image"), "new-1", 1.0,
+            telegram_file_ids=["new-1", "new-2"], cache_hit=True,
+        )
+        row = await repo.find_cached("https://youtube.com/watch?v=abc")
+    finally:
+        await repo.close_db()
+
+    assert {"telegram_file_ids", "cache_hit"} <= columns
+    assert repo.decode_file_ids(row) == ["new-1", "new-2"]
+    # The pre-existing row survived untouched, and its NOT NULL cache_hit backfilled.
+    with sqlite3.connect(path) as conn:
+        old = conn.execute(
+            "SELECT url, status, telegram_file_id, telegram_file_ids, cache_hit "
+            "FROM requests WHERE id = 1"
+        ).fetchone()
+    assert old == ("https://youtube.com/watch?v=old", "success", "old-fid", None, 0)
+
+
+async def test_column_migration_is_idempotent(tmp_path: Path):
+    """Init over an already-current schema adds nothing and must not raise."""
+    path = tmp_path / "pre-cache2.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_PRE_CACHE_COLUMNS_SCHEMA)
+
+    await repo.init_db(path)
+    await repo.close_db()
+    await repo.init_db(path)  # second pass: schema already matches
+    try:
+        async with repo._session() as session:
+            conn = await session.connection()
+            columns = await conn.run_sync(
+                lambda c: [col["name"] for col in inspect(c).get_columns("requests")]
+            )
+    finally:
+        await repo.close_db()
+
+    assert columns.count("cache_hit") == 1
+    assert columns.count("telegram_file_ids") == 1
+
+
 async def test_legacy_purge_is_idempotent(tmp_path: Path):
     """Running init twice over a legacy DB must not fail the second time."""
     path = tmp_path / "legacy2.db"
@@ -507,12 +589,82 @@ async def test_find_cached_file_id_misses_when_too_old(db_path: Path):
     assert row.telegram_file_id == "fid-stale"
 
 
-async def test_find_cached_file_id_skips_images(db_path: Path):
-    """Image rows hold only the first carousel item's file_id — never replay them."""
+async def test_find_cached_skips_images_without_a_file_id_list(db_path: Path):
+    """A pre-migration image row holds only the first carousel item — never replay it."""
     request = await new_request()
-    await repo.mark_success(request.id, make_media(kind="image"), "fid-photo", 1.0)
+    await repo.mark_success(
+        request.id, make_media(kind="image"), "fid-photo", 1.0, telegram_file_ids=[]
+    )
 
-    assert await repo.find_cached_file_id("https://youtube.com/watch?v=abc") is None
+    assert await repo.find_cached("https://youtube.com/watch?v=abc") is None
+
+
+async def test_find_cached_returns_image_rows_with_a_file_id_list(db_path: Path):
+    request = await new_request()
+    await repo.mark_success(
+        request.id,
+        make_media(kind="image"),
+        "fid-1",
+        1.0,
+        telegram_file_ids=["fid-1", "fid-2", "fid-3"],
+    )
+
+    row = await repo.find_cached("https://youtube.com/watch?v=abc")
+
+    assert row is not None
+    assert row.media_kind == "image"
+    assert repo.decode_file_ids(row) == ["fid-1", "fid-2", "fid-3"]
+    # The single-id column keeps holding the first item, exactly as before.
+    assert row.telegram_file_id == "fid-1"
+
+
+async def test_find_cached_returns_single_image_rows(db_path: Path):
+    """One image is just a list of one — still replayable."""
+    request = await new_request()
+    await repo.mark_success(
+        request.id, make_media(kind="image"), "solo", 1.0, telegram_file_ids=["solo"]
+    )
+
+    row = await repo.find_cached("https://youtube.com/watch?v=abc")
+    assert repo.decode_file_ids(row) == ["solo"]
+
+
+async def test_mark_success_defaults_the_list_to_the_single_file_id(db_path: Path):
+    """Callers that don't pass a list still get a usable one (video/animation path)."""
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "only-one", 1.0)
+
+    row = await repo.find_cached("https://youtube.com/watch?v=abc")
+    assert repo.decode_file_ids(row) == ["only-one"]
+
+
+async def test_cache_hit_flag_round_trip(db_path: Path):
+    fresh = await new_request()
+    await repo.mark_success(fresh.id, make_media(), "fid", 1.0)
+    replayed = await new_request()
+    await repo.mark_success(replayed.id, make_media(), "fid", 0.1, cache_hit=True)
+
+    async with repo._session() as session:
+        assert (await session.get(DownloadRequest, fresh.id)).cache_hit is False
+        assert (await session.get(DownloadRequest, replayed.id)).cache_hit is True
+
+
+async def test_decode_file_ids_tolerates_corrupt_json(db_path: Path):
+    """A garbled blob degrades to the single-id column, never raises."""
+    row = SimpleNamespace(id=1, telegram_file_ids="{not json", telegram_file_id="fallback")
+    assert repo.decode_file_ids(row) == ["fallback"]
+
+    empty = SimpleNamespace(id=2, telegram_file_ids=None, telegram_file_id=None)
+    assert repo.decode_file_ids(empty) == []
+
+
+async def test_find_cached_file_id_is_an_alias_of_find_cached(db_path: Path):
+    """The old name still works for any caller that hasn't moved over."""
+    request = await new_request()
+    await repo.mark_success(request.id, make_media(), "fid-video", 1.0)
+
+    row = await repo.find_cached_file_id("https://youtube.com/watch?v=abc")
+    assert row.telegram_file_id == "fid-video"
 
 
 async def test_find_cached_file_id_accepts_animations(db_path: Path):

@@ -69,6 +69,12 @@ class TestDetectPlatform:
             ("https://clips.twitch.tv/SomeClip", "twitch"),
             ("https://www.pinterest.com/pin/123/", "pinterest"),
             ("https://pin.it/abc", "pinterest"),
+            ("https://www.reddit.com/r/aww/comments/abc/title/", "reddit"),
+            ("https://old.reddit.com/r/aww/comments/abc/title/", "reddit"),
+            ("https://reddit.com/r/pics/comments/xyz/", "reddit"),
+            ("https://redd.it/abc123", "reddit"),
+            ("https://i.redd.it/abc123.jpg", "reddit"),
+            ("https://v.redd.it/abc123", "reddit"),
             ("https://example.com/video.mp4", "other"),
             ("https://vimeo.com/12345", "other"),
         ],
@@ -152,6 +158,26 @@ class TestNormalizeUrl:
 
     def test_preserves_path_case_and_query_values(self):
         assert normalize_url("https://example.com/AbC?q=Hello") == "https://example.com/AbC?q=Hello"
+
+    def test_reddit_urls_survive_the_generic_path(self):
+        """Reddit needs no special-casing — just don't mangle its permalinks."""
+        assert normalize_url("https://www.reddit.com/r/aww/comments/abc/a_title/") == (
+            "https://reddit.com/r/aww/comments/abc/a_title"
+        )
+        # Tracking params go, the permalink stays.
+        assert normalize_url(
+            "https://www.reddit.com/r/aww/comments/abc/a_title/?utm_source=share"
+        ) == "https://reddit.com/r/aww/comments/abc/a_title"
+        # A share link's opaque id lives in the PATH, so the `s` drop-param (which
+        # only ever applies to the query) must not touch it.
+        assert normalize_url("https://www.reddit.com/r/aww/s/AbCdEf") == (
+            "https://reddit.com/r/aww/s/AbCdEf"
+        )
+        # old.reddit is a distinct host and stays one; redd.it short links pass through.
+        assert normalize_url("https://old.reddit.com/r/aww/comments/abc/") == (
+            "https://old.reddit.com/r/aww/comments/abc"
+        )
+        assert normalize_url("https://redd.it/abc123") == "https://redd.it/abc123"
 
 
 import socket

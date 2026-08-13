@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReactionTypeEmoji
 from aiogram.utils.chat_action import ChatActionSender
 
 from tgdl import i18n
@@ -40,6 +40,9 @@ MEDIA_GROUP_LIMIT = 10
 
 #: Per-request workdir name prefix; the startup sweep in main.py matches on it.
 WORKDIR_PREFIX = "req-"
+
+#: Put on the user's message while we work on it, and cleared when we're done.
+ACK_EMOJI = "👀"
 
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
@@ -133,13 +136,24 @@ async def _audit_create_request(message: Message, url: str) -> int | None:
 
 
 async def _audit_success(
-    request_id: int | None, media: MediaResult, file_id: str | None, elapsed_s: float
+    request_id: int | None,
+    media: MediaResult,
+    file_id: str | None,
+    elapsed_s: float,
+    *,
+    file_ids: list[str] | None = None,
+    cache_hit: bool = False,
 ) -> None:
     if request_id is None:
         return
     try:
         await repo.mark_success(
-            request_id=request_id, media=media, telegram_file_id=file_id, elapsed_s=elapsed_s
+            request_id=request_id,
+            media=media,
+            telegram_file_id=file_id,
+            elapsed_s=elapsed_s,
+            telegram_file_ids=file_ids,
+            cache_hit=cache_hit,
         )
     except Exception:
         log.exception("audit: mark_success failed")
@@ -157,8 +171,8 @@ async def _audit_failure(request_id: int | None, error: BaseException, elapsed_s
 # ----------------------------------------------------------------- file_id cache
 # The fastest possible download is the one we don't do: Telegram will re-send any
 # file we already uploaded if we hand it back the file_id (ARCHITECTURE.md §6.1).
-# Videos and animations only — an image gallery's audit row holds just the first
-# item's file_id, so replaying it would silently drop the rest of the carousel.
+# Videos, animations and images all qualify; an image row is only replayed once it
+# carries the full ordered file_id list, so a carousel comes back whole.
 
 
 def _is_story_url(url: str) -> bool:
@@ -176,8 +190,8 @@ def _is_story_url(url: str) -> bool:
 
 async def _try_send_cached(
     message: Message, url: str, *, quote: bool
-) -> tuple[str, MediaResult] | None:
-    """Re-send a previously uploaded file by file_id. Returns (file_id, media) or None.
+) -> tuple[list[str], MediaResult] | None:
+    """Re-send previously uploaded media by file_id. Returns (file_ids, media) or None.
 
     Never raises: a repo error or a file_id Telegram has since forgotten just means
     a cache miss, and the caller downloads as usual.
@@ -186,33 +200,43 @@ async def _try_send_cached(
         if _is_story_url(url):
             return None
 
-        row = await repo.find_cached_file_id(_safe_normalized(url))
+        row = await repo.find_cached(_safe_normalized(url))
         if row is None:
             return None
 
-        file_id = row.telegram_file_id
-        # The repo query already filters these out; belt-and-braces, because
-        # replaying an image row would ship a carousel as a single photo.
-        if not file_id or row.media_kind not in repo.CACHEABLE_MEDIA_KINDS:
+        # The repo query already filters these out; belt-and-braces, because an
+        # image row without its full list would ship a carousel as a single photo.
+        if row.media_kind not in repo.CACHEABLE_MEDIA_KINDS:
+            return None
+        file_ids = repo.decode_file_ids(row)
+        if not file_ids or (row.media_kind == "image" and not row.telegram_file_ids):
             return None
 
         duration = int(row.duration_s) if row.duration_s else None
         if row.media_kind == "video":
             sender = message.reply_video if quote else message.answer_video
             sent = await sender(
-                file_id,
+                file_ids[0],
                 width=row.width,
                 height=row.height,
                 duration=duration,
                 supports_streaming=True,
             )
-        else:  # animation
+        elif row.media_kind == "animation":
             sender = message.reply_animation if quote else message.answer_animation
             sent = await sender(
-                file_id, width=row.width, height=row.height, duration=duration
+                file_ids[0], width=row.width, height=row.height, duration=duration
             )
+        elif len(file_ids) > 1:
+            # A carousel: Telegram re-groups its own files from their ids alone.
+            group = [InputMediaPhoto(media=f) for f in file_ids[:MEDIA_GROUP_LIMIT]]
+            sender = message.reply_media_group if quote else message.answer_media_group
+            sent = await sender(group)
+        else:
+            sender = message.reply_photo if quote else message.answer_photo
+            sent = await sender(file_ids[0])
 
-        log.info("cache hit for %s (%s)", url, row.media_kind)
+        log.info("cache hit for %s (%s x%d)", url, row.media_kind, len(file_ids))
         media = MediaResult(
             path=Path("cached"),
             kind=row.media_kind,
@@ -225,7 +249,8 @@ async def _try_send_cached(
             duration_s=row.duration_s,
             transcoded=bool(row.transcoded),
         )
-        return _extract_file_id(sent) or file_id, media
+        # Prefer the ids Telegram just handed back; fall back to the stored ones.
+        return _extract_file_ids(sent) or file_ids, media
     except Exception:
         log.info("file_id cache unusable for %s; downloading instead", url, exc_info=True)
         return None
@@ -243,6 +268,20 @@ async def _reply(message: Message, text: str, *, quote: bool) -> Message | None:
     except Exception:
         log.exception("failed to send text message")
         return None
+
+
+def _extract_file_ids(sent: Any) -> list[str]:
+    """Every file_id in a send result, in order.
+
+    A media group returns one Message per item, and the cache needs all of them —
+    replaying a carousel from just the first id would silently drop the rest.
+    """
+    if sent is None:
+        return []
+    if isinstance(sent, (list, tuple)):
+        return [f for item in sent if (f := _extract_file_id(item))]
+    single = _extract_file_id(sent)
+    return [single] if single else []
 
 
 def _extract_file_id(sent: Any) -> str | None:
@@ -293,8 +332,12 @@ async def _send_single(message: Message, media: MediaResult, *, quote: bool) -> 
 
 async def _send_results(
     message: Message, results: list[MediaResult], *, quote: bool
-) -> str | None:
-    """Send all results; returns the file_id of the first sent item (audit key)."""
+) -> list[str]:
+    """Send all results; returns every file_id in send order (the cache's raw material).
+
+    The first entry is the audit row's `telegram_file_id`; the whole list is what makes
+    a carousel replayable from cache later (§6.1).
+    """
     images = [r for r in results if r.kind == "image"]
 
     # Multiple images -> one media group (no captions).
@@ -302,14 +345,37 @@ async def _send_results(
         group = [InputMediaPhoto(media=FSInputFile(r.path)) for r in images[:MEDIA_GROUP_LIMIT]]
         sender = message.reply_media_group if quote else message.answer_media_group
         sent = await sender(group)
-        return _extract_file_id(sent)
+        return _extract_file_ids(sent)
 
-    first_file_id: str | None = None
+    file_ids: list[str] = []
     for media in results[:MEDIA_GROUP_LIMIT]:
         file_id = await _send_single(message, media, quote=quote)
-        if first_file_id is None:
-            first_file_id = file_id
-    return first_file_id
+        if file_id:
+            file_ids.append(file_id)
+    return file_ids
+
+
+# --------------------------------------------------------------------- reaction ack
+# A 👀 on the *user's own message* while we work, cleared when we're done. This is not
+# a caption or branding on the delivered media (CLAUDE.md's plain-output rule stands) —
+# it's an acknowledgment that the link was seen, on the message the user sent us.
+
+
+async def _set_reaction(message: Message, emoji: str | None) -> None:
+    """Set (or clear, with emoji=None) a reaction on the triggering message.
+
+    Best-effort in every direction: channel posts are skipped (no from_user, and
+    reaction permissions there are unreliable), and any API refusal — old message,
+    missing permission, reactions disabled in the chat — is a debug line and nothing
+    more. The arriving media or error reply is the real answer.
+    """
+    if message.from_user is None:
+        return
+    try:
+        reaction = [ReactionTypeEmoji(emoji=emoji)] if emoji else []
+        await message.react(reaction)
+    except Exception:
+        log.debug("react(%s) failed", emoji, exc_info=True)
 
 
 # ------------------------------------------------------------------------- main flow
@@ -368,50 +434,68 @@ async def _run_download(
     except Exception:
         log.debug("send_chat_action failed", exc_info=True)
 
+    await _set_reaction(message, ACK_EMOJI)
+
     workdir: Path | None = None
     try:
-        # Already uploaded this link once? Re-send by file_id — no download, no
-        # semaphore, no workdir. Cheap enough to run inside the user slot.
-        cached = await _try_send_cached(message, url, quote=quote)
-        if cached is not None:
-            cached_file_id, cached_media = cached
-            await _audit_success(
-                request_id, cached_media, cached_file_id, time.monotonic() - started
-            )
-            return
-
-        # The semaphore caps concurrent *downloads* only: uploading to Telegram is
-        # network-bound and shouldn't keep the next requester queued behind us.
-        async with runtime.get_semaphore():
-            base = Path(settings.download_dir)
-            base.mkdir(parents=True, exist_ok=True)
-            workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX, dir=base))
-
-            async with ChatActionSender.typing(
-                bot=message.bot, chat_id=message.chat.id
-            ):
-                results = await service.download_media(
-                    url,
-                    workdir,
-                    max_size_bytes=settings.max_file_size_bytes,
-                    max_height=settings.max_height,
-                    timeout_s=settings.download_timeout_s,
+        # Coalesce concurrent requests for the same link: the first is the leader and
+        # downloads; anyone who arrives while it runs waits here and then finds the
+        # leader's upload in the cache below. A follower holds neither the global
+        # semaphore nor a workdir while it waits.
+        async with runtime.coalesce(_safe_normalized(url)):
+            # Already uploaded this link once? Re-send by file_id — no download, no
+            # semaphore, no workdir. Cheap enough to run inside the user slot.
+            cached = await _try_send_cached(message, url, quote=quote)
+            if cached is not None:
+                cached_file_ids, cached_media = cached
+                await _audit_success(
+                    request_id,
+                    cached_media,
+                    cached_file_ids[0] if cached_file_ids else None,
+                    time.monotonic() - started,
+                    file_ids=cached_file_ids,
+                    cache_hit=True,
                 )
+                return
 
-        if not results:
-            raise DownloadError("downloader returned no results")
+            # The semaphore caps concurrent *downloads* only: uploading to Telegram is
+            # network-bound and shouldn't keep the next requester queued behind us.
+            async with runtime.get_semaphore():
+                base = Path(settings.download_dir)
+                base.mkdir(parents=True, exist_ok=True)
+                workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX, dir=base))
 
-        # Upload phase: the download succeeded and we know the media kind, so
-        # now (and only now) show the matching "sending a photo/video…" action.
-        action_sender = (
-            ChatActionSender.upload_photo
-            if all(r.kind == "image" for r in results)
-            else ChatActionSender.upload_video
-        )
-        async with action_sender(bot=message.bot, chat_id=message.chat.id):
-            file_id = await _send_results(message, results, quote=quote)
+                async with ChatActionSender.typing(
+                    bot=message.bot, chat_id=message.chat.id
+                ):
+                    results = await service.download_media(
+                        url,
+                        workdir,
+                        max_size_bytes=settings.max_file_size_bytes,
+                        max_height=settings.max_height,
+                        timeout_s=settings.download_timeout_s,
+                    )
 
-        await _audit_success(request_id, results[0], file_id, time.monotonic() - started)
+            if not results:
+                raise DownloadError("downloader returned no results")
+
+            # Upload phase: the download succeeded and we know the media kind, so
+            # now (and only now) show the matching "sending a photo/video…" action.
+            action_sender = (
+                ChatActionSender.upload_photo
+                if all(r.kind == "image" for r in results)
+                else ChatActionSender.upload_video
+            )
+            async with action_sender(bot=message.bot, chat_id=message.chat.id):
+                file_ids = await _send_results(message, results, quote=quote)
+
+            await _audit_success(
+                request_id,
+                results[0],
+                file_ids[0] if file_ids else None,
+                time.monotonic() - started,
+                file_ids=file_ids,
+            )
 
     except DownloadError as err:
         log.info("download failed for %s: %s", url, err)
@@ -425,6 +509,9 @@ async def _run_download(
         await _reply(message, responses.generic_error(locale), quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
     finally:
+        # The media (or the error reply) is the real answer, so the "I'm on it"
+        # marker comes off either way.
+        await _set_reaction(message, None)
         if workdir is not None:
             shutil.rmtree(workdir, ignore_errors=True)
 

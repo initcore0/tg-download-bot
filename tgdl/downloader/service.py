@@ -28,8 +28,8 @@ from tgdl.downloader.urls import detect_platform, is_safe_public_url
 log = logging.getLogger(__name__)
 
 # Platforms whose posts are frequently multi-item (image carousels, multi-image
-# tweets) rather than single videos.
-GALLERY_PLATFORMS = {"instagram", "pinterest", "twitter"}
+# tweets, Reddit image posts and galleries) rather than single videos.
+GALLERY_PLATFORMS = {"instagram", "pinterest", "twitter", "reddit"}
 MAX_GALLERY_ITEMS = 10
 RETRY_HEIGHT = 480
 

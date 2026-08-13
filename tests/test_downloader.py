@@ -187,6 +187,11 @@ class TestGalleries:
         await service.download_media("https://instagram.com/p/x", tmp_path, max_size_bytes=CAP)
         assert seen["playlist_items"] == "1-10"
 
+        await service.download_media(
+            "https://reddit.com/r/aww/comments/abc/", tmp_path, max_size_bytes=CAP
+        )
+        assert seen["playlist_items"] == "1-10"
+
         await service.download_media("https://youtube.com/watch?v=x", tmp_path, max_size_bytes=CAP)
         assert seen["playlist_items"] is None
 
@@ -375,6 +380,22 @@ class TestFallbackGating:
             "https://instagram.com/p/photos", tmp_path, max_size_bytes=CAP
         )
         assert result.kind == "image"
+
+    async def test_reddit_is_routed_to_the_image_engine(
+        self, stub_extract, monkeypatch, jpg_file, tmp_path
+    ):
+        """Reddit image posts and galleries are common; yt-dlp only sees the videos."""
+        assert "reddit" in service.GALLERY_PLATFORMS
+        stub_extract([], error=ExtractionError("There is no video in this post"))
+        stub_fetch(monkeypatch, [jpg_file, jpg_file])
+
+        results = await service.download_media(
+            "https://www.reddit.com/r/aww/comments/abc/a_title/",
+            tmp_path,
+            max_size_bytes=CAP,
+        )
+        assert len(results) == 2
+        assert all(r.kind == "image" and r.platform == "reddit" for r in results)
 
     async def test_unknown_platform_still_falls_back(
         self, stub_extract, monkeypatch, jpg_file, tmp_path

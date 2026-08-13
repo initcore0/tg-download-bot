@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -124,6 +125,52 @@ def _materialize_cookies(settings: Settings) -> tuple[dict[str, Path | None], li
     return jars, temp_files
 
 
+#: PyPI's JSON metadata endpoint for the package whose extractors keep us alive.
+YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
+
+#: Hard bound on the freshness check. It is a log line, not a feature: if PyPI is slow
+#: or unreachable we drop it rather than hold anything up.
+YTDLP_CHECK_TIMEOUT_S = 3
+
+
+async def check_ytdlp_freshness() -> None:
+    """Log a WARNING when the installed yt-dlp is behind the latest release on PyPI.
+
+    Extractors break weekly and yt-dlp ships fixes at the same pace, so a pinned or
+    forgotten version is the most likely cause of a site suddenly failing for every
+    user. This turns that into one visible log line at startup.
+
+    Entirely best-effort: no network, a timeout, or unexpected JSON logs at debug and
+    is swallowed. Runs as a background task and must never delay or fail startup.
+    """
+    try:
+        import aiohttp
+        from yt_dlp.version import __version__ as installed
+
+        timeout = aiohttp.ClientTimeout(total=YTDLP_CHECK_TIMEOUT_S)
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.get(YTDLP_PYPI_URL) as response,
+        ):
+            response.raise_for_status()
+            payload = await response.json()
+
+        latest = payload["info"]["version"]
+        if latest != installed:
+            log.warning(
+                "yt-dlp %s is installed but %s is the latest release — extractors break "
+                "weekly; upgrade if downloads start failing",
+                installed,
+                latest,
+            )
+        else:
+            log.debug("yt-dlp %s is current", installed)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("yt-dlp freshness check failed; skipping", exc_info=True)
+
+
 async def _resolve_username(bot: Bot) -> str | None:
     """Cache the bot's @username so group/channel mention matching works."""
     try:
@@ -204,13 +251,23 @@ async def run(settings: Settings) -> None:
     runtime.configure(
         settings.max_concurrent_downloads,
         max_per_user=settings.max_per_user_concurrent,
+        follower_timeout_s=settings.download_timeout_s + runtime.FOLLOWER_TIMEOUT_SLACK_S,
     )
+
+    # Fire-and-forget: a stale yt-dlp is the single most likely cause of a future
+    # "nothing downloads any more", so make it visible in the logs. Never awaited in
+    # the critical path — the reference only exists to keep it off the GC's radar.
+    version_check = asyncio.create_task(check_ytdlp_freshness())
 
     try:
         await _resolve_username(bot)
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, handle_signals=True)
     finally:
+        # The freshness check logs its own failures; shutdown only needs it stopped.
+        version_check.cancel()
+        with suppress(BaseException):
+            await version_check
         try:
             await repo.close_db()
         except Exception:
