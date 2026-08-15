@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     # Max in-flight downloads a single user can hold at once (abuse guard).
     max_per_user_concurrent: int = 1
 
+    # When true, groups/supergroups no longer need the @botusername mention: any
+    # message carrying a link to a *known* media platform is downloaded. Off by
+    # default — the mention is what keeps the bot quiet in a chat it was added to
+    # for one person's benefit. Turn it on for a small, trusted group where
+    # "paste a link, get the video" is the point.
+    #
+    # Only ever loosens groups. Channel posts still require the mention: a channel
+    # is a broadcast surface, and auto-replying to every link an admin posts there
+    # is a different and much louder proposition.
+    group_auto_download: bool = False
+
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024

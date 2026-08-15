@@ -65,6 +65,25 @@ will silently not work in groups. Disable privacy mode:
 > Re-add the bot to existing groups after changing this — the setting is applied when the
 > bot joins.
 
+### Mention-free groups
+
+Typing `@yourbotname <link>` collides with **inline mode**: Telegram intercepts the
+`@botname …` prefix as an inline query and shows a results panel instead of letting you
+send the message, so there is nothing to press Enter on. If your group is small and
+trusted, skip the mention entirely — set
+
+```
+GROUP_AUTO_DOWNLOAD=true
+```
+
+and anyone can paste a link and get the video back as a reply. Links to hosts the bot
+doesn't recognize (news articles, docs, shop pages) are ignored **silently** — no
+download, no error reply — so normal conversation isn't disturbed. The trade-off: the
+host list is narrower than what yt-dlp actually supports, so an exotic-but-downloadable
+link is ignored too. Mentioning the bot still forces an attempt on any link at all.
+
+This affects groups only. Channel posts always require the mention.
+
 ### For channels
 
 The bot must be added to the channel as an **administrator** to receive `channel_post`
@@ -156,6 +175,7 @@ All settings are read from the environment or a `.env` file. Only the token is r
 | `MAX_HEIGHT` | `720` | Maximum video height; larger sources are downscaled. |
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Global cap on simultaneous downloads. |
 | `MAX_PER_USER_CONCURRENT` | `1` | Max in-flight downloads per user (abuse guard). |
+| `GROUP_AUTO_DOWNLOAD` | `false` | In groups, act on any known-platform link without an `@mention`; unrecognized hosts are ignored silently (see [mention-free groups](#mention-free-groups)). Groups only — channel posts always need the mention. |
 | `DOWNLOAD_TIMEOUT_S` | `300` | Per-request timeout in seconds. |
 | `YOUTUBE_COOKIES` | — | cookies.txt **content** (raw or base64, auto-detected) used **only for YouTube** — bypasses the bot-check (see below). |
 | `INSTAGRAM_COOKIES` | — | cookies.txt content used **only for Instagram**: stories, plus one automatic retry when a post is login-walled. Public reels/posts stay anonymous so the account isn't flagged. |

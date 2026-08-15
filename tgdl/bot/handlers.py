@@ -140,6 +140,22 @@ def _is_group(message: Message) -> bool:
     return message.chat.type in GROUP_CHAT_TYPES
 
 
+def is_known_media_url(url: str) -> bool:
+    """True if `url` points at a platform we recognize by host.
+
+    The gate for mention-free group downloads (`GROUP_AUTO_DOWNLOAD`). Without a
+    mention there is no signal that a link was meant for the bot, so an unknown
+    host — a news article, a doc, a shop — must produce silence rather than a
+    failed download and an error reply in everyone's chat.
+
+    Deliberately stricter than what the downloader accepts: yt-dlp handles far
+    more hosts than `detect_platform` knows, so some genuinely downloadable links
+    are ignored here. That is the intended trade. Mentioning the bot still forces
+    a download attempt for anything, which is the escape hatch for those.
+    """
+    return _safe_platform(url) != "other"
+
+
 # ------------------------------------------------------------------- audit wrappers
 # Audit must never break the user flow (ARCHITECTURE.md §6 / CLAUDE.md). Rows are
 # anonymous: we record only the link, platform, coarse chat_type, and performance
@@ -796,13 +812,22 @@ async def handle_private(message: Message, settings: Settings) -> None:
 
 @router.message(F.chat.type.in_(GROUP_CHAT_TYPES))
 async def handle_group(message: Message, settings: Settings) -> None:
-    """Groups/supergroups: only act when the bot is mentioned by @username."""
-    if not mentions_bot(message, runtime.get_bot_username()):
-        return
+    """Groups/supergroups: act on a mention, or on any known-platform link when
+    `GROUP_AUTO_DOWNLOAD` is set.
+
+    The two paths differ in how much benefit of the doubt the link gets. A mention
+    is an explicit "this one is for you", so the URL goes through whatever it is.
+    Without one, only a link whose host we recognize is worth acting on, and
+    anything else is dropped in silence — see `is_known_media_url`.
+    """
     url = extract_first_url(message_text(message))
     if not url:
         return
-    await process_url(message, url, settings)
+    if mentions_bot(message, runtime.get_bot_username()):
+        await process_url(message, url, settings)
+        return
+    if settings.group_auto_download and is_known_media_url(url):
+        await process_url(message, url, settings)
 
 
 @router.channel_post()
