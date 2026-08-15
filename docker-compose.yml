@@ -14,9 +14,66 @@ services:
     # bind mount would silently reset the SQLite audit DB each time. A named
     # volume lives in Docker's own storage and survives redeploys; the
     # entrypoint fixes its root ownership on first start.
+    #
+    # DOWNLOAD_DIR is pointed at the /downloads tmpfs below (see `tmpfs:` and the
+    # environment override) so per-request workdirs never touch persistent disk and
+    # a hostile download can't exhaust it — the tmpfs is RAM-backed and size-capped.
     volumes:
       - tgdl-data:/app/data
     restart: unless-stopped
+
+    # --- Container hardening (defense-in-depth; see deploy/SECURITY.md) --------
+    # These are standard compose keys that Coolify preserves on redeploy. If a key
+    # ever fails to land (verify with `docker inspect`, see the runbook), it is a
+    # weakened posture, not a broken bot.
+
+    # Immutable root filesystem: an in-container RCE cannot overwrite the app code,
+    # binaries, or the venv. All writable paths are explicit mounts below.
+    read_only: true
+
+    # Block privilege escalation (setuid binaries, `sudo`, ping-style caps). The
+    # entrypoint still needs uid 0 briefly to chown the volume, then drops via gosu —
+    # no-new-privileges does not prevent that, it prevents *gaining* privileges.
+    security_opt:
+      - no-new-privileges:true
+
+    # Drop every Linux capability. The bot needs none: it makes outbound TCP as an
+    # unprivileged user and runs ffmpeg/yt-dlp, none of which require a capability.
+    cap_drop:
+      - ALL
+
+    # Bound the fork/thread count so an extractor bug or fork-bomb payload can't
+    # exhaust host PIDs. 256 is generous for aiogram + a few ffmpeg/yt-dlp workers.
+    pids_limit: 256
+
+    # Cap memory so an oversized in-memory decode can't OOM the shared host; the
+    # kernel kills just this container. Reservation is a soft floor for the scheduler.
+    mem_limit: 1g
+    mem_reservation: 256m
+
+    # Writable scratch on tmpfs (RAM-backed, wiped on restart) so the read-only root
+    # still has the few places the app must write:
+    #   /tmp        — cookie jars are materialized here via mkstemp at startup
+    #                 (tgdl/main.py) with 0600 perms; keep it small.
+    #   /downloads  — per-request workdirs (DOWNLOAD_DIR points here). size= caps it
+    #                 so a hostile stream can't fill anything, and it's never on disk.
+    # The SQLite DB stays on the persistent tgdl-data volume (writable, above).
+    #   /deno-cache — deno is yt-dlp's JS runtime for YouTube's signature challenges
+    #                 (see Dockerfile). It writes a cache under $DENO_DIR; on the
+    #                 read-only root that write would fail and YouTube extraction
+    #                 would break, so DENO_DIR is pointed here.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /downloads:rw,nosuid,nodev,size=3g
+      - /deno-cache:rw,nosuid,nodev,size=128m
+    environment:
+      # Send per-request workdirs to the /downloads tmpfs instead of data/downloads.
+      # DATABASE_PATH keeps its default (data/tgdl.db on the persistent volume).
+      DOWNLOAD_DIR: /downloads
+      # Keep deno's cache on tmpfs so YouTube's JS challenge runtime can write under
+      # the read-only root filesystem.
+      DENO_DIR: /deno-cache
+    # --------------------------------------------------------------------------
 
   # Optional self-hosted Bot API server: raises the upload cap from 50 MB to 2 GB.
   # Behind a profile so a plain `docker compose up` never starts it — run

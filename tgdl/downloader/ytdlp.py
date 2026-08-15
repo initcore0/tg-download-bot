@@ -121,6 +121,7 @@ def build_options(
     youtube_clients: tuple[str, ...] = (),
     cookies_file: Path | None = None,
     format_override: str | None = None,
+    max_filesize_bytes: int | None = None,
 ) -> dict[str, Any]:
     """yt-dlp options: quiet, contained inside `workdir`, no writes elsewhere.
 
@@ -131,6 +132,11 @@ def build_options(
     `format_override` replaces the video format selector (and its video-oriented
     format_sort) wholesale — the audio path asks for a bare audio stream and would
     otherwise inherit a selector that only ever yields video.
+    `max_filesize_bytes`, when set, is a hard early-abort ceiling: yt-dlp refuses to
+    start (or aborts) a download whose declared size exceeds it, so a hostile server
+    cannot stream a huge file to exhaust disk before the post-download size cap runs.
+    It is deliberately a generous multiple of the send cap (computed by the caller) so
+    it never rejects a legitimately-sized media file — it only bounds pathological ones.
     """
     opts: dict[str, Any] = {
         "format": format_override or build_format_selector(max_height),
@@ -166,6 +172,8 @@ def build_options(
         opts["extractor_args"] = {"youtube": {"player_client": list(youtube_clients)}}
     if cookies_file is not None:
         opts["cookiefile"] = str(cookies_file)
+    if max_filesize_bytes is not None:
+        opts["max_filesize"] = max_filesize_bytes
     return opts
 
 
@@ -245,6 +253,7 @@ async def extract(
     max_attempts: int = _MAX_ATTEMPTS,
     cookies_file: Path | None = None,
     format_override: str | None = None,
+    max_filesize_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Download `url` into `workdir`; return one info dict per downloaded item.
 
@@ -255,6 +264,8 @@ async def extract(
 
     `format_override` swaps the format selector — the audio path reuses this whole
     retry ladder rather than growing a second copy of it.
+    `max_filesize_bytes`, when set, is passed straight through to `build_options` as a
+    hard early-abort disk-exhaustion ceiling (see there).
     """
     is_youtube = detect_platform(url) == "youtube"
     last_exc: Exception | None = None
@@ -276,6 +287,7 @@ async def extract(
             youtube_clients=clients,
             cookies_file=attempt_cookies,
             format_override=format_override,
+            max_filesize_bytes=max_filesize_bytes,
         )
         try:
             info = await asyncio.to_thread(_extract_sync, url, opts, download=download)

@@ -421,6 +421,33 @@ One-time caveat, documented in `.env.example` and deliberately **not** automated
 token already used against the cloud API must be released with a single `logOut` call
 to the cloud API before a local server will accept it.
 
+## 8.2 Deployment security (defense-in-depth)
+
+The bot downloads arbitrary user-supplied URLs through yt-dlp / gallery-dl / ffmpeg —
+large parsers of hostile input. `urls.is_safe_public_url` is a best-effort app-level
+SSRF guard, but it cannot stop DNS-rebinding or HTTP-redirect re-resolution, and it is
+irrelevant to in-container RCE. The real containment lives below the app, in
+`deploy/`:
+
+- **Per-container egress firewall** (`deploy/tgdl-egress-firewall.sh`, reapplied on boot
+  by `deploy/tgdl-egress-firewall.service`): DOCKER-USER rules scoped to the tgdl bridge
+  only, dropping new connections to the LAN, sibling docker subnets, link-local/metadata,
+  and loopback while allowing DNS and outbound public internet. Sibling containers on
+  other bridges are untouched.
+- **Container hardening** (`docker-compose.yml`): read-only rootfs, `cap_drop: [ALL]`,
+  `no-new-privileges`, pids/mem limits, and tmpfs for the writable scratch paths
+  (`/tmp` cookies, `/downloads` workdirs via `DOWNLOAD_DIR`, `/deno-cache`).
+- **Download-size ceiling**: `ytdlp.build_options` / `extract` take an optional
+  `max_filesize_bytes` (threaded from `service.download_media`'s cap as
+  `max(3×cap, 200 MB)`, and from the audio path as `max(3×cap, 100 MB)`) so a hostile
+  server cannot stream an unbounded file to exhaust disk before the post-download size
+  policy (§5.3) runs.
+
+Full operator runbook, threat model, apply/verify/rollback steps, the daemon-restart
+caveat, and the honest "does / does not protect" section: **`deploy/SECURITY.md`**. The
+host-specific values (bridge name, LAN CIDR, sibling subnets) are configurable and must
+be re-verified per host.
+
 ## 9. Module ownership & boundaries (for parallel build agents)
 
 | Area | Files | Owner |
