@@ -1975,3 +1975,101 @@ class TestInlineMode:
         await handlers.handle_inline_query(make_inline_query("https://youtu.be/abc"))
 
         assert "media_kinds" not in mock_repo.find_cached.await_args.kwargs
+
+
+# ------------------------------------------------------------------- admin alerts
+# The handler's side of §7.3: every failure is reported, with the platform, and the
+# user's reply is never affected by what alerting does.
+
+
+class TestAdminAlertHook:
+    @pytest.fixture
+    def mock_alerts(self, monkeypatch):
+        """Patch alerts.report_failure — the tier logic has its own test module."""
+        mock = AsyncMock()
+        monkeypatch.setattr(handlers.alerts, "report_failure", mock)
+        return mock
+
+    async def test_download_error_is_reported_with_the_platform(
+        self, settings, mock_repo, mock_download, mock_alerts
+    ):
+        err = ExtractionError("private post")
+        mock_download.side_effect = err
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)
+
+        mock_alerts.assert_awaited_once()
+        platform, error, url = mock_alerts.await_args.args
+        assert platform == "youtube"  # from the stubbed detect_platform
+        assert error is err
+        assert url == "https://youtu.be/abc"
+
+    async def test_unexpected_exception_is_reported(
+        self, settings, mock_repo, mock_download, mock_alerts
+    ):
+        boom = RuntimeError("ffmpeg exploded")
+        mock_download.side_effect = boom
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)
+
+        assert mock_alerts.await_args.args[1] is boom
+
+    async def test_success_is_not_reported(
+        self, settings, tmp_path, mock_repo, mock_download, mock_alerts
+    ):
+        mock_download.return_value = [make_media(tmp_path)]
+
+        await handlers.handle_private(make_message("https://youtu.be/abc"), settings)
+
+        mock_alerts.assert_not_awaited()
+
+    async def test_audio_failure_is_reported(
+        self, settings, mock_repo, mock_audio, mock_alerts
+    ):
+        err = ExtractionError("no audio track")
+        mock_audio.side_effect = err
+        msg = make_message("/mp3 https://youtu.be/abc")
+
+        await handlers.cmd_mp3(msg, settings)
+
+        assert mock_alerts.await_args.args[1] is err
+
+    async def test_the_user_still_gets_their_error_reply(
+        self, settings, mock_repo, mock_download, mock_alerts
+    ):
+        mock_download.side_effect = UnsupportedUrlError()
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)
+
+        msg.answer.assert_awaited_once_with(i18n.t("error.unsupported_url", "en"))
+        mock_alerts.assert_awaited_once()
+
+    async def test_an_alert_failure_does_not_affect_the_user_flow(
+        self, settings, mock_repo, mock_download, mock_alerts
+    ):
+        mock_download.side_effect = UnsupportedUrlError()
+        mock_alerts.side_effect = RuntimeError("telegram down")
+        msg = make_message("https://youtu.be/abc")
+
+        await handlers.handle_private(msg, settings)  # must not raise
+
+        sent_texts = [c.args[0] for c in msg.answer.await_args_list]
+        assert i18n.t("error.unsupported_url", "en") in sent_texts
+        mock_repo.mark_failure.assert_awaited_once()
+
+    async def test_reply_failures_do_not_alert(
+        self, settings, tmp_path, mock_repo, mock_download, mock_alerts
+    ):
+        """A send that fails is between us and one user; the bot itself is fine."""
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://youtu.be/abc")
+        msg.answer_video.side_effect = RuntimeError("telegram 400")
+
+        await handlers.handle_private(msg, settings)
+
+        # The send error surfaces as an unexpected exception, which *is* reported —
+        # what must not happen is an extra alert from the error-reply path itself.
+        assert mock_alerts.await_count == 1

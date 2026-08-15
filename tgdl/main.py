@@ -24,7 +24,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramUnauthorizedError
 from sqlalchemy.exc import OperationalError
 
-from tgdl.bot import handlers, runtime
+from tgdl.bot import alerts, handlers, runtime
 from tgdl.config import Settings, load_settings
 from tgdl.downloader import cookies, transcode
 from tgdl.storage import repo
@@ -166,6 +166,14 @@ async def check_ytdlp_freshness() -> None:
                 installed,
                 latest,
             )
+            # The log line only helps someone already reading logs. A stale yt-dlp is
+            # the most likely root cause of a future outage, so tell the admin once.
+            await alerts.notify(
+                "ytdlp-stale",
+                f"yt-dlp <b>{installed}</b> is installed, but <b>{latest}</b> is the "
+                "latest release. Extractors break weekly — upgrade if downloads "
+                "start failing.",
+            )
         else:
             log.debug("yt-dlp %s is current", installed)
     except asyncio.CancelledError:
@@ -258,6 +266,11 @@ async def run(settings: Settings) -> None:
     sweep_orphan_workdirs(settings.download_dir, settings.download_timeout_s)
 
     bot = _make_bot(settings, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    # Admin alerting, off unless ADMIN_USER_ID is set and ADMIN_ALERTS is on. Wired
+    # up before the freshness check below so that check's alert has somewhere to go.
+    alerts.configure(bot if settings.admin_alerts else None, settings.admin_user_id)
+
     dp = Dispatcher()
     dp.include_router(handlers.router)
 
