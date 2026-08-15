@@ -8,6 +8,11 @@ RUN apt-get update \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
+# deno is yt-dlp's JavaScript runtime for YouTube's signature / proof-of-origin
+# challenges. Without one, yt-dlp 2026+ deprecates YouTube extraction, formats go
+# missing, and datacenter IPs escalate straight to "confirm you're not a bot".
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
