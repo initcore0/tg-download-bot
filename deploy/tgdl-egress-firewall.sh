@@ -71,6 +71,13 @@ DNS_RESOLVER="${DNS_RESOLVER:-127.0.0.11}"
 TAG="${TAG:-tgdl-egress}"
 
 CHAIN="DOCKER-USER"
+# The INPUT chain carries container->HOST traffic. DOCKER-USER (a FORWARD sub-chain)
+# only sees container->container / container->internet FORWARDing, so it does NOT
+# cover the container connecting to a service the host itself exposes on a bridge
+# gateway IP (e.g. 10.0.x.1) or the LAN IP — that is host-local and lands in INPUT.
+# Without an INPUT drop the container can still reach host-bound services (Caddy on
+# :80/:443, etc.), which is a real pivot. We add the same bridge-scoped drops there.
+INPUT_CHAIN="INPUT"
 IPT="iptables"
 
 # ---------------------------------------------------------------------------
@@ -95,20 +102,25 @@ ensure_chain() {
     fi
 }
 
-# Delete every rule in DOCKER-USER that carries our comment tag. Loops because rule
-# numbers shift as we delete; matches on the tag so nothing else is touched.
-remove_tagged() {
-    local removed=0
+# Delete every tagged rule from one chain. Loops because rule numbers shift as we
+# delete; matches on the comment tag so nothing else in the chain is touched.
+remove_tagged_from() {
+    local chain="$1" removed=0 line
     while true; do
-        # List with line numbers, find the first line carrying our tag, delete it.
-        local line
-        line="$("$IPT" -L "$CHAIN" --line-numbers -n 2>/dev/null \
+        line="$("$IPT" -L "$chain" --line-numbers -n 2>/dev/null \
                     | awk -v tag="$TAG" '$0 ~ tag {print $1; exit}')"
         [ -n "$line" ] || break
-        "$IPT" -D "$CHAIN" "$line"
+        "$IPT" -D "$chain" "$line"
         removed=$((removed + 1))
     done
-    log "removed $removed previously-tagged rule(s)"
+    log "removed $removed previously-tagged rule(s) from $chain"
+}
+
+# Clean both chains we own. INPUT is NOT wiped on docker restart (only DOCKER-USER
+# is), so an idempotent re-apply must clear our INPUT rules too or they accumulate.
+remove_tagged() {
+    remove_tagged_from "$CHAIN"
+    remove_tagged_from "$INPUT_CHAIN"
 }
 
 # Insert our rules at the TOP of DOCKER-USER, in reverse of the desired evaluation
@@ -147,20 +159,47 @@ insert_rules() {
     # inbound connections. -i is not set: this matches return flow regardless of iface.
     # shellcheck disable=SC2086
     "$IPT" -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT $c
+
+    # --- INPUT chain: block the container from reaching the HOST itself ----------
+    # DOCKER-USER above does not see container->host-IP traffic (it is host-local, so
+    # it lands in INPUT, not FORWARD). Without these, the container can still connect
+    # to services the host binds on its bridge-gateway IPs (10.0.x.1) or its LAN IP —
+    # e.g. a reverse proxy on :80/:443 — which is a real pivot onto the host. Same
+    # bridge-scoping (-i "$TGDL_BRIDGE"), so the host's own and sibling traffic is
+    # untouched. Established replies are allowed first, mirroring the DOCKER-USER order.
+    # shellcheck disable=SC2086
+    "$IPT" -I "$INPUT_CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT $c
+    # Insert the DROPs after that ACCEPT (position 2..), so return traffic still passes.
+    for cidr in "${BLOCK_CIDRS[@]}"; do
+        # shellcheck disable=SC2086
+        "$IPT" -I "$INPUT_CHAIN" 2 -i "$TGDL_BRIDGE" -d "$cidr" -j DROP $c
+    done
+    # DNS to the embedded resolver is host-local too; allow it above the drops so name
+    # resolution keeps working even though 127.0.0.11 sits inside the 127.0.0.0/8 drop.
+    # shellcheck disable=SC2086
+    "$IPT" -I "$INPUT_CHAIN" 2 -i "$TGDL_BRIDGE" -d "$DNS_RESOLVER" -p udp --dport 53 -j ACCEPT $c
+    # shellcheck disable=SC2086
+    "$IPT" -I "$INPUT_CHAIN" 2 -i "$TGDL_BRIDGE" -d "$DNS_RESOLVER" -p tcp --dport 53 -j ACCEPT $c
 }
 
 print_summary() {
     log "installed rules on $CHAIN (bridge=$TGDL_BRIDGE, tag=$TAG):"
     "$IPT" -S "$CHAIN" | grep -- "$TAG" | sed 's/^/    /'
+    log "installed rules on $INPUT_CHAIN (container->host block):"
+    "$IPT" -S "$INPUT_CHAIN" | grep -- "$TAG" | sed 's/^/    /'
     cat <<EOF
 
-  Policy for traffic INGRESSING from $TGDL_BRIDGE:
-    ACCEPT  ESTABLISHED,RELATED            (return traffic for our outbound conns)
-    ACCEPT  udp/tcp 53 to $DNS_RESOLVER    (DNS via docker embedded resolver)
-    DROP    -> ${BLOCK_CIDRS[*]}
-    ACCEPT  everything else                (public internet: media sites, Telegram)
+  Policy for traffic from $TGDL_BRIDGE:
+    DOCKER-USER (container -> other containers / internet):
+      ACCEPT  ESTABLISHED,RELATED          (return traffic for our outbound conns)
+      ACCEPT  udp/tcp 53 to $DNS_RESOLVER  (DNS via docker embedded resolver)
+      DROP    -> ${BLOCK_CIDRS[*]}
+      ACCEPT  everything else              (public internet: media sites, Telegram)
+    INPUT (container -> the host itself, incl. bridge-gateway + LAN IPs):
+      ACCEPT  ESTABLISHED,RELATED / DNS, then DROP -> the same CIDRs
 
-  Sibling containers on other docker bridges are UNAFFECTED (rules are -i $TGDL_BRIDGE).
+  Sibling containers on other docker bridges, and the host's own traffic, are
+  UNAFFECTED — every DROP is scoped to -i $TGDL_BRIDGE.
 
   IMPORTANT: DOCKER-USER is wiped when the docker daemon restarts. Install the
   systemd unit so these rules are reapplied on boot / docker restart:
