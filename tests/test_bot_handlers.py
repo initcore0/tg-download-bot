@@ -221,6 +221,11 @@ def audio_row(*, file_ids: list[str] | None = None, **overrides) -> SimpleNamesp
     )
 
 
+#: The genuine `detect_platform`, captured before `_stub_urls` replaces it, for the
+#: few tests that need real host recognition (see TestGroupAutoDownload).
+from tgdl.downloader.urls import detect_platform as _REAL_DETECT_PLATFORM
+
+
 @pytest.fixture(autouse=True)
 def _stub_urls(monkeypatch):
     """urls.py is an M1 stub raising NotImplementedError -> exercise the fallback regex."""
@@ -462,6 +467,142 @@ class TestRouting:
         await handlers.handle_channel_post(msg, settings)
 
         mock_download.assert_not_awaited()
+
+
+class TestGroupAutoDownload:
+    """GROUP_AUTO_DOWNLOAD: mention-free downloads, silent on unknown hosts."""
+
+    @pytest.fixture(autouse=True)
+    def _real_detect_platform(self, monkeypatch):
+        """Undo the module-wide `_stub_urls`, which maps every URL to "youtube".
+
+        These tests turn on host recognition, so a stub that recognizes
+        everything would make the silent-on-unknown cases vacuously pass.
+        """
+        from tgdl.downloader import urls as urls_mod
+
+        monkeypatch.setattr(
+            urls_mod, "detect_platform", _REAL_DETECT_PLATFORM, raising=False
+        )
+
+    @pytest.fixture
+    def auto_settings(self, settings) -> Settings:
+        return settings.model_copy(update={"group_auto_download": True})
+
+    async def test_known_platform_link_processed_without_mention(
+        self, auto_settings, tmp_path, mock_repo, mock_download
+    ):
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("https://vm.tiktok.com/xyz", chat_type="supergroup")
+
+        await handlers.handle_group(msg, auto_settings)
+
+        mock_download.assert_awaited_once()
+        assert mock_download.await_args.args[0] == "https://vm.tiktok.com/xyz"
+        msg.reply_video.assert_awaited_once()
+
+    async def test_link_among_other_text_is_processed(
+        self, auto_settings, tmp_path, mock_repo, mock_download
+    ):
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message("смотри что нашёл https://youtu.be/abc 😄", chat_type="group")
+
+        await handlers.handle_group(msg, auto_settings)
+
+        mock_download.assert_awaited_once()
+        assert mock_download.await_args.args[0] == "https://youtu.be/abc"
+
+    async def test_unknown_host_ignored_silently(
+        self, auto_settings, mock_repo, mock_download
+    ):
+        """The whole point of the flag's guard: no download, and no error reply."""
+        msg = make_message("https://example.com/some-article", chat_type="group")
+
+        await handlers.handle_group(msg, auto_settings)
+
+        mock_download.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+        msg.answer.assert_not_awaited()
+        mock_repo.create_request.assert_not_awaited()
+
+    async def test_unknown_host_still_processed_when_mentioned(
+        self, auto_settings, tmp_path, mock_repo, mock_download
+    ):
+        """A mention overrides the host filter — it is an explicit instruction."""
+        mock_download.return_value = [make_media(tmp_path)]
+        msg = make_message(
+            f"@{BOT_USERNAME} https://example.com/video.mp4", chat_type="group"
+        )
+
+        await handlers.handle_group(msg, auto_settings)
+
+        mock_download.assert_awaited_once()
+
+    async def test_flag_off_keeps_mention_requirement(
+        self, settings, mock_repo, mock_download
+    ):
+        msg = make_message("https://vm.tiktok.com/xyz", chat_type="group")
+
+        await handlers.handle_group(msg, settings)
+
+        mock_download.assert_not_awaited()
+
+    async def test_channel_posts_unaffected_by_flag(
+        self, auto_settings, mock_repo, mock_download
+    ):
+        """The flag loosens groups only; a channel still needs the mention."""
+        msg = make_message(
+            "https://youtu.be/abc", chat_type="channel", from_user=False
+        )
+
+        await handlers.handle_channel_post(msg, auto_settings)
+
+        mock_download.assert_not_awaited()
+
+    async def test_message_without_url_ignored(
+        self, auto_settings, mock_repo, mock_download
+    ):
+        msg = make_message("как у кого дела?", chat_type="group")
+
+        await handlers.handle_group(msg, auto_settings)
+
+        mock_download.assert_not_awaited()
+
+
+class TestIsKnownMediaUrl:
+    @pytest.fixture(autouse=True)
+    def _real_detect_platform(self, monkeypatch):
+        """See TestGroupAutoDownload: `_stub_urls` would recognize every host."""
+        from tgdl.downloader import urls as urls_mod
+
+        monkeypatch.setattr(
+            urls_mod, "detect_platform", _REAL_DETECT_PLATFORM, raising=False
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://youtu.be/abc",
+            "https://www.youtube.com/watch?v=abc",
+            "https://vm.tiktok.com/ZTDYfQJFL/",
+            "https://www.instagram.com/reel/abc/",
+            "https://x.com/user/status/1",
+            "https://clips.twitch.tv/abc",
+        ],
+    )
+    def test_known_platforms(self, url):
+        assert handlers.is_known_media_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/article",
+            "https://docs.google.com/document/d/abc",
+            "https://news.ycombinator.com/item?id=1",
+        ],
+    )
+    def test_unknown_hosts(self, url):
+        assert handlers.is_known_media_url(url) is False
 
 
 # -------------------------------------------------------------------- happy paths

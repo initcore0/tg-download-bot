@@ -12,6 +12,7 @@ Works in two contexts:
 - **Groups/channels**: the bot is triggered when mentioned (`@botusername <link>`).
   Note: for groups, privacy mode should be disabled via BotFather (`/setprivacy` → Disable)
   so the bot reliably receives mention messages. In channels the bot must be an admin.
+  With `GROUP_AUTO_DOWNLOAD=true` (§7.4) groups drop the mention requirement entirely.
 
 Every request is audited in a database: what URL, what happened, how long it took, and
 the resulting Telegram `file_id` — which powers the re-send-without-re-download cache
@@ -378,6 +379,31 @@ freshness check (§6.2) uses the same `notify()` for a one-off "yt-dlp is stale"
 — never user ids, chat ids, or chat types. The admin learns the bot is broken, not
 who was using it. The counters live in memory for the run and are never persisted.
 
+### 7.4 Mention-free groups (`GROUP_AUTO_DOWNLOAD`)
+
+Typing `@botname <link>` is also how Telegram opens an **inline query** (§7.1): the
+client swallows the prefix into a results panel, so on many clients the mention form
+cannot be sent as a message at all. Where inline mode is enabled, the documented group
+trigger is therefore partly unusable — which is what this flag exists to route around.
+
+When set, `handle_group` acts on a link with no mention. The gate is
+`handlers.is_known_media_url`, i.e. `urls.detect_platform(url) != "other"`:
+
+- **Known host** (youtube/tiktok/instagram/twitter/twitch/pinterest/reddit) → the
+  normal §4 flow, reply-to the triggering message.
+- **Anything else** → **silence**. No download, no audit row, no error reply. Without
+  a mention there is no evidence the link was meant for the bot, so the failure mode
+  of guessing wrong is an error message interrupting an unrelated conversation. A
+  quiet miss is strictly cheaper than a noisy false positive.
+- **Mentioned** → unchanged: the host filter is skipped and any link is attempted.
+  The mention is an explicit instruction, so it still reaches hosts `detect_platform`
+  has never heard of but yt-dlp supports.
+
+Scope is deliberately narrow. **Groups and supergroups only** — `handle_channel_post`
+never consults the flag, because a channel is a broadcast surface where auto-replying
+to every admin's link is a much louder change. Default is off: the mention is what
+keeps the bot quiet in a chat it was added to for one person's benefit.
+
 ## 8. Config (env / `.env` — see `.env.example`)
 
 ```
@@ -399,6 +425,8 @@ COOKIES              same, generic jar for platforms without a dedicated one
 ADMIN_USER_ID        default 0 (disabled) — the only id allowed to run /stats (§7.2)
 ADMIN_ALERTS         default true — DM that admin when the bot is unhealthy (§7.3);
                      false keeps /stats without the messages
+GROUP_AUTO_DOWNLOAD  default false — groups act on known-platform links with no
+                     @mention, silent on unknown hosts (§7.4). Groups only.
 TELEGRAM_API_URL     default "" (Telegram's cloud API) — see §8.1
 ```
 
