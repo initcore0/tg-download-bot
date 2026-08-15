@@ -465,6 +465,57 @@ class TestYtdlpFreshnessCheck:
 
         notify.assert_not_awaited()
 
+    async def test_zero_padding_is_not_stale(self, monkeypatch, caplog):
+        """Regression: yt-dlp says "2026.07.04", PyPI normalizes to "2026.7.4".
+
+        Same release — a raw string comparison false-alarmed the admin on every
+        current install.
+        """
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2026.07.04")
+        self._stub_aiohttp(monkeypatch, latest="2026.7.4")
+        notify = AsyncMock()
+        monkeypatch.setattr(main_mod.alerts, "notify", notify)
+
+        with caplog.at_level("WARNING", logger="tgdl"):
+            await main_mod.check_ytdlp_freshness()
+
+        notify.assert_not_awaited()
+        assert not any("latest release" in r.message for r in caplog.records)
+
+    async def test_a_newer_local_build_is_not_stale(self, monkeypatch):
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2099.12.31")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.30")
+        notify = AsyncMock()
+        monkeypatch.setattr(main_mod.alerts, "notify", notify)
+
+        await main_mod.check_ytdlp_freshness()
+
+        notify.assert_not_awaited()
+
+    async def test_an_unparseable_dev_build_is_not_stale(self, monkeypatch):
+        """A nightly like 2026.7.4.232815.dev0 must stay silent, not false-alarm."""
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2026.7.4.232815.dev0")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.31")
+        notify = AsyncMock()
+        monkeypatch.setattr(main_mod.alerts, "notify", notify)
+
+        await main_mod.check_ytdlp_freshness()
+
+        notify.assert_not_awaited()
+
+    def test_version_is_older_comparisons(self):
+        assert main_mod._version_is_older("2020.01.01", "2026.7.4")
+        assert not main_mod._version_is_older("2026.07.04", "2026.7.4")
+        assert not main_mod._version_is_older("2026.7.10", "2026.7.9")
+        # 2026.7.10 vs 2026.7.9: numeric compare, not lexicographic.
+        assert main_mod._version_is_older("2026.7.9", "2026.7.10")
+
     async def test_silent_when_current(self, monkeypatch, caplog):
         import yt_dlp.version
 
