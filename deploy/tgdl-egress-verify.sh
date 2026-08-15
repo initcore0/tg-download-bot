@@ -69,7 +69,10 @@ log "using interpreter: $PY"
 # Uses a single short-timeout TCP connect from inside the container.
 probe_connect() {
     local host="$1" port="$2"
-    docker exec "$CONTAINER" "$PY" - "$host" "$port" "$CONNECT_TIMEOUT" <<'PYEOF'
+    # -i is required: the probe program arrives on stdin (heredoc). Without it docker
+    # exec hands python an empty stdin, python runs nothing, exits 0, and every probe
+    # would falsely read as CONNECTED.
+    docker exec -i "$CONTAINER" "$PY" - "$host" "$port" "$CONNECT_TIMEOUT" <<'PYEOF'
 import socket, sys
 host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 try:

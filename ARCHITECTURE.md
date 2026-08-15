@@ -434,14 +434,17 @@ irrelevant to in-container RCE. The real containment lives below the app, in
   only, dropping new connections to the LAN, sibling docker subnets, link-local/metadata,
   and loopback while allowing DNS and outbound public internet. Sibling containers on
   other bridges are untouched.
-- **Container hardening** (`docker-compose.yml`): read-only rootfs, `cap_drop: [ALL]`,
-  `no-new-privileges`, pids/mem limits, and tmpfs for the writable scratch paths
-  (`/tmp` cookies, `/downloads` workdirs via `DOWNLOAD_DIR`, `/deno-cache`).
+- **Container hardening** (`docker-compose.yml`): read-only rootfs (`UV_NO_CACHE=1` so
+  `uv run` tolerates it), `cap_drop: [ALL]` plus `cap_add: [CHOWN, SETUID, SETGID]` for
+  the root-then-gosu entrypoint, `no-new-privileges`, pids/mem limits, and tmpfs for the
+  writable scratch paths (`/tmp` cookies, `/downloads` workdirs via `DOWNLOAD_DIR`,
+  `/deno-cache`).
 - **Download-size ceiling**: `ytdlp.build_options` / `extract` take an optional
   `max_filesize_bytes` (threaded from `service.download_media`'s cap as
   `max(3×cap, 200 MB)`, and from the audio path as `max(3×cap, 100 MB)`) so a hostile
   server cannot stream an unbounded file to exhaust disk before the post-download size
-  policy (§5.3) runs.
+  policy (§5.3) runs. Soft ceiling: yt-dlp checks it only against a declared
+  `Content-Length` in the plain-HTTP downloader; the hard disk bound is the tmpfs cap.
 
 Full operator runbook, threat model, apply/verify/rollback steps, the daemon-restart
 caveat, and the honest "does / does not protect" section: **`deploy/SECURITY.md`**. The

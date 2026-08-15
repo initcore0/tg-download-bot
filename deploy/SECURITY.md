@@ -57,7 +57,7 @@ firewall does.
 | `deploy/tgdl-egress-firewall.sh` | Installs the DOCKER-USER egress rules, scoped to the tgdl bridge only. Idempotent. `--remove` rolls back. |
 | `deploy/tgdl-egress-firewall.service` | systemd oneshot that reapplies the rules on boot / docker restart. |
 | `deploy/tgdl-egress-verify.sh` | Acceptance test: proves public egress works and internal targets are blocked, from inside the container. |
-| `docker-compose.yml` (bot service) | read-only rootfs, dropped caps, no-new-privileges, pids/mem limits, tmpfs for scratch. |
+| `docker-compose.yml` (bot service) | read-only rootfs, caps dropped to the 3 the entrypoint needs, no-new-privileges, pids/mem limits, tmpfs for scratch. |
 | `tgdl/downloader/ytdlp.py` + `audio.py` + `service.py` | `max_filesize` early-abort ceiling so a hostile server can't stream an unbounded file to fill disk. |
 
 ---
@@ -122,6 +122,7 @@ reorders unknown keys, so do not assume:
 docker inspect tgdl-bot --format '
   ReadonlyRootfs: {{.HostConfig.ReadonlyRootfs}}
   CapDrop:        {{.HostConfig.CapDrop}}
+  CapAdd:         {{.HostConfig.CapAdd}}
   SecurityOpt:    {{.HostConfig.SecurityOpt}}
   PidsLimit:      {{.HostConfig.PidsLimit}}
   Memory:         {{.HostConfig.Memory}}
@@ -129,9 +130,11 @@ docker inspect tgdl-bot --format '
 docker inspect tgdl-bot --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'DOWNLOAD_DIR|DENO_DIR'
 ```
 
-Expect: `ReadonlyRootfs: true`, `CapDrop: [ALL]`, `SecurityOpt` containing
-`no-new-privileges`, `PidsLimit: 256`, `Memory: 1073741824`, three tmpfs entries,
-`DOWNLOAD_DIR=/downloads`, `DENO_DIR=/deno-cache`.
+Expect: `ReadonlyRootfs: true`, `CapDrop: [ALL]`, `CapAdd: [CHOWN SETUID SETGID]` (the
+entrypoint's chown + gosu need exactly these while still root; the bot process itself
+runs as tgdl with an empty effective set), `SecurityOpt` containing `no-new-privileges`,
+`PidsLimit: 256`, `Memory: 1073741824`, three tmpfs entries, `DOWNLOAD_DIR=/downloads`,
+`DENO_DIR=/deno-cache`, `UV_NO_CACHE=1` (uv otherwise aborts on the read-only root).
 
 ### 3.5 Run the acceptance test
 
@@ -229,7 +232,10 @@ pathologically large downloads).
   escalation, and caps PIDs/memory/disk — so an exploit has far less to work with and
   cannot exhaust the shared host.
 - Bounds download size early, so a hostile server cannot fill the disk before the normal
-  size cap runs.
+  size cap runs. Note yt-dlp only enforces `max_filesize` against a declared
+  `Content-Length` in its plain-HTTP downloader (not HLS/DASH fragments, and for chunked
+  YouTube downloads the length is per chunk), so it is a soft ceiling; the hard bound on
+  disk is the size-capped `/downloads` tmpfs.
 
 **Does NOT:**
 
@@ -267,7 +273,7 @@ cannot be used as a launch point against the rest of the network.
 - [ ] systemd unit installed, `enable --now`, status active (exited).
 - [ ] Rebooted (or `systemctl restart docker`) and confirmed the rules are still present.
 - [ ] Compose hardening committed to the repo/Coolify config and redeployed.
-- [ ] `docker inspect tgdl-bot` confirms ReadonlyRootfs, CapDrop=[ALL], no-new-privileges, PidsLimit, Memory, Tmpfs, DOWNLOAD_DIR, DENO_DIR.
+- [ ] `docker inspect tgdl-bot` confirms ReadonlyRootfs, CapDrop=[ALL], CapAdd=[CHOWN SETUID SETGID], no-new-privileges, PidsLimit, Memory, Tmpfs, DOWNLOAD_DIR, DENO_DIR, UV_NO_CACHE.
 - [ ] `tgdl-egress-verify.sh` exits 0 — all four checks pass.
 - [ ] Sibling containers (trading stack, Gitea, Coolify) still healthy — the rules are scoped to the tgdl bridge and must not have touched them.
 - [ ] yt-dlp / gallery-dl / ffmpeg update cadence in place.

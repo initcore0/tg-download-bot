@@ -37,10 +37,18 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    # Drop every Linux capability. The bot needs none: it makes outbound TCP as an
-    # unprivileged user and runs ffmpeg/yt-dlp, none of which require a capability.
+    # Drop every Linux capability, then add back only the three the *entrypoint* needs
+    # while it is still uid 0: CHOWN to fix volume ownership, SETUID/SETGID for gosu to
+    # drop to the tgdl user. (Without them the container dies at start: `chown:
+    # Operation not permitted`.) The bot process itself runs as tgdl and, being non-root
+    # with no file caps, ends up with an empty effective set anyway — it makes outbound
+    # TCP and runs ffmpeg/yt-dlp, none of which need a capability.
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
 
     # Bound the fork/thread count so an extractor bug or fork-bomb payload can't
     # exhaust host PIDs. 256 is generous for aiogram + a few ffmpeg/yt-dlp workers.
@@ -73,6 +81,10 @@ services:
       # Keep deno's cache on tmpfs so YouTube's JS challenge runtime can write under
       # the read-only root filesystem.
       DENO_DIR: /deno-cache
+      # The image's CMD is `uv run --no-sync tgdl-bot`; uv insists on initialising a
+      # cache dir at startup (~/.cache/uv) and aborts on the read-only root without
+      # this. With no-cache it uses a throwaway dir under /tmp (tmpfs above).
+      UV_NO_CACHE: "1"
     # --------------------------------------------------------------------------
 
   # Optional self-hosted Bot API server: raises the upload cap from 50 MB to 2 GB.
