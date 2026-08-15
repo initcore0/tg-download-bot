@@ -46,7 +46,7 @@ def stub_extract(monkeypatch):
     """Install a fake ytdlp.extract that copies fixtures into the workdir."""
 
     def install(sources: list[Path], *, entry_overrides: list[dict] | None = None, error=None):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
             if error is not None:
                 raise error
             entries = []
@@ -176,7 +176,7 @@ class TestGalleries:
     async def test_playlist_items_requested_for_gallery_platforms(self, monkeypatch, jpg_file, tmp_path):
         seen = {}
 
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
             seen["playlist_items"] = playlist_items
             dst = Path(workdir) / "a.jpg"
             shutil.copy(jpg_file, dst)
@@ -195,10 +195,28 @@ class TestGalleries:
         await service.download_media("https://youtube.com/watch?v=x", tmp_path, max_size_bytes=CAP)
         assert seen["playlist_items"] is None
 
+    async def test_extract_gets_a_bounded_early_abort_ceiling(
+        self, monkeypatch, h264_mp4, tmp_path
+    ):
+        """A hostile server can't fill the disk: extract carries a hard max_filesize."""
+        seen = {}
+
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
+            seen["max_filesize_bytes"] = max_filesize_bytes
+            dst = Path(workdir) / "a.mp4"
+            shutil.copy(h264_mp4, dst)
+            return [fake_entry(dst)]
+
+        monkeypatch.setattr(service.ytdlp, "extract", _extract)
+        await service.download_media("https://example.com/v", tmp_path, max_size_bytes=CAP)
+
+        assert seen["max_filesize_bytes"] == service._download_filesize_ceiling(CAP)
+        assert seen["max_filesize_bytes"] >= CAP
+
     async def test_partial_gallery_failure_still_returns_good_items(
         self, monkeypatch, jpg_file, tmp_path
     ):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
             good = Path(workdir) / "good.jpg"
             shutil.copy(jpg_file, good)
             bad = Path(workdir) / "bad.jpg"
@@ -476,7 +494,8 @@ class TestCookieRouting:
         seen = {}
 
         async def _extract(
-            url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None
+            url, workdir, *, max_height, playlist_items=None, download=True,
+            cookies_file=None, max_filesize_bytes=None,
         ):
             seen["cookies_file"] = cookies_file
             dst = Path(workdir) / "a.mp4"
@@ -695,7 +714,7 @@ class TestErrorMapping:
             await service.download_media("https://example.com/a", tmp_path, max_size_bytes=CAP)
 
     async def test_no_file_produced_raises_extraction_error(self, monkeypatch, tmp_path):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
             return [{"id": "x", "title": "t"}]  # no requested_downloads / missing file
 
         monkeypatch.setattr(service.ytdlp, "extract", _extract)
@@ -703,7 +722,7 @@ class TestErrorMapping:
             await service.download_media("https://example.com/a", tmp_path, max_size_bytes=CAP)
 
     async def test_corrupt_media_raises_transcode_error(self, monkeypatch, tmp_path):
-        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None):
+        async def _extract(url, workdir, *, max_height, playlist_items=None, download=True, cookies_file=None, max_filesize_bytes=None):
             bad = Path(workdir) / "bad.mp4"
             bad.write_bytes(b"not real media")
             return [fake_entry(bad)]

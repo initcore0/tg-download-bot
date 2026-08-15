@@ -1,0 +1,49 @@
+# tgdl-egress-firewall.service — reapply the tgdl egress rules on boot.
+#
+# DOCKER-USER is re-created EMPTY every time the docker daemon (re)starts, so the
+# rules installed by tgdl-egress-firewall.sh do not survive a reboot or a
+# `systemctl restart docker`. This oneshot unit reapplies them after docker comes
+# up. It is idempotent (the script removes its own tagged rules before re-adding),
+# so running it repeatedly is safe.
+#
+# INSTALL (as root):
+#   install -m 0755 deploy/tgdl-egress-firewall.sh /usr/local/sbin/tgdl-egress-firewall.sh
+#   install -m 0644 deploy/tgdl-egress-firewall.service /etc/systemd/system/tgdl-egress-firewall.service
+#   systemctl daemon-reload
+#   systemctl enable --now tgdl-egress-firewall.service
+#
+# VERIFY:
+#   systemctl status tgdl-egress-firewall.service
+#   iptables -S DOCKER-USER | grep tgdl-egress
+#
+# DAEMON-RESTART CAVEAT (see deploy/SECURITY.md):
+#   This unit reapplies the rules on BOOT and whenever docker.service (re)starts,
+#   because it is ordered After=docker.service and bound to it via BindsTo — a
+#   `systemctl restart docker` restarts this unit too, closing the window where
+#   DOCKER-USER would otherwise sit empty. If you restart dockerd by other means
+#   (e.g. the daemon crashes and is restarted out-of-band), re-run the script or
+#   `systemctl restart tgdl-egress-firewall.service` and re-check with the grep above.
+#   A path/timer or docker-event watcher is an option for tighter coverage; this
+#   unit is deliberately kept simple.
+
+[Unit]
+Description=tgdl per-container egress firewall (DOCKER-USER rules)
+After=docker.service
+Requires=docker.service
+# Restart alongside docker so a `systemctl restart docker` reapplies the rules.
+BindsTo=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Edit these to match the current host if the network / LAN changes; they mirror the
+# script's defaults and override its built-ins. Re-verify per deploy/SECURITY.md.
+Environment=TGDL_BRIDGE=br-bdb150cb47ea
+Environment=LAN_CIDR=192.168.68.0/22
+ExecStart=/usr/local/sbin/tgdl-egress-firewall.sh
+# On stop (e.g. `systemctl disable --now`), pull our rules back out cleanly.
+ExecStop=/usr/local/sbin/tgdl-egress-firewall.sh --remove
+
+[Install]
+WantedBy=multi-user.target

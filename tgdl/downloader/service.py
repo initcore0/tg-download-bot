@@ -33,6 +33,23 @@ GALLERY_PLATFORMS = {"instagram", "pinterest", "twitter", "reddit"}
 MAX_GALLERY_ITEMS = 10
 RETRY_HEIGHT = 480
 
+# Absolute floor for the yt-dlp early-abort ceiling (see `_download_filesize_ceiling`):
+# even a tiny send cap must leave enough headroom for a normal ≤720p clip that the
+# size-cap retry ladder would happily shrink post-download.
+_MIN_DOWNLOAD_CEILING_BYTES = 200 * 1024 * 1024
+
+
+def _download_filesize_ceiling(max_size_bytes: int) -> int:
+    """Hard early-abort size for yt-dlp: generous multiple of the send cap, but bounded.
+
+    The post-download size policy (§5.3) is what actually enforces the 48 MB send cap,
+    re-encoding oversized-but-legitimate videos down. This ceiling exists only to stop a
+    hostile server from streaming an unbounded file to fill the disk before that policy
+    ever runs, so it is set well above any real ≤720p clip (3× the cap, floored at
+    200 MB) and never rejects a genuinely-sized download.
+    """
+    return max(3 * max_size_bytes, _MIN_DOWNLOAD_CEILING_BYTES)
+
 
 async def download_media(
     url: str,
@@ -112,6 +129,7 @@ async def _run_pipeline(
             max_height=max_height,
             playlist_items=playlist_items,
             cookies_file=cookies.resolve(platform, story=story),
+            max_filesize_bytes=_download_filesize_ceiling(max_size_bytes),
         )
     except TransientExtractionError:
         # Throttling or a bot-check says "not right now", not "this post has no

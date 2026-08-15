@@ -165,6 +165,18 @@ class TestFormatOverride:
         assert seen["format_override"] == audio_mod.AUDIO_FORMAT
         assert "m4a" in seen["format_override"]
 
+    async def test_extract_gets_a_bounded_early_abort_ceiling(
+        self, stub_extract, aac_m4a, tmp_path
+    ):
+        """A hostile server can't stream an unbounded file: extract carries a hard cap."""
+        seen = stub_extract(aac_m4a)
+
+        await audio_mod.download_audio(
+            "https://youtube.com/watch?v=x", tmp_path, max_size_bytes=CAP
+        )
+
+        assert seen["max_filesize_bytes"] == max(3 * CAP, audio_mod._MIN_AUDIO_CEILING_BYTES)
+
     def test_build_options_uses_the_override(self, tmp_path):
         opts = ytdlp.build_options(
             tmp_path, max_height=720, format_override="ba[ext=m4a]/bestaudio"

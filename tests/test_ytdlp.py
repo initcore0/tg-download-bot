@@ -227,6 +227,33 @@ class TestBuildOptions:
         assert "height<=480" in sel
         assert "vcodec^=avc1" in sel  # prefer h264 first
 
+    def test_max_filesize_present_when_passed(self, tmp_path):
+        opts = ytdlp.build_options(tmp_path, max_height=720, max_filesize_bytes=123_456)
+        assert opts["max_filesize"] == 123_456
+
+    def test_max_filesize_absent_by_default(self, tmp_path):
+        opts = ytdlp.build_options(tmp_path, max_height=720)
+        assert "max_filesize" not in opts
+
+    async def test_extract_threads_max_filesize_to_build_options(self, monkeypatch, tmp_path):
+        seen: dict = {}
+
+        def _build(workdir, **kwargs):
+            seen.update(kwargs)
+            return {}
+
+        async def _to_thread(fn, *args, **kwargs):
+            return {"id": "x", "requested_downloads": []}
+
+        monkeypatch.setattr(ytdlp, "build_options", _build)
+        monkeypatch.setattr(ytdlp.asyncio, "to_thread", _to_thread)
+
+        await ytdlp.extract(
+            "https://example.com/x", tmp_path, max_height=720, max_filesize_bytes=999
+        )
+
+        assert seen["max_filesize_bytes"] == 999
+
 
 async def _no_sleep(_seconds):
     return None

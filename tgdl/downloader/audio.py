@@ -38,6 +38,11 @@ AUDIO_FORMAT = "ba[ext=m4a]/bestaudio"
 #: Extensions whose contents are already an AAC-in-MP4 track — send as-is.
 _PASSTHROUGH_EXTENSIONS = {".m4a", ".aac", ".mp4"}
 
+#: Absolute floor for the yt-dlp early-abort ceiling on audio. Audio tracks are small,
+#: so a modest bound is plenty of headroom for any real track while still stopping a
+#: hostile server from streaming an unbounded stream to exhaust the disk.
+_MIN_AUDIO_CEILING_BYTES = 100 * 1024 * 1024
+
 
 @dataclass(slots=True)
 class AudioResult:
@@ -101,6 +106,7 @@ async def _run_pipeline(url: str, workdir: Path, *, max_size_bytes: int) -> Audi
         max_height=0,  # unused: format_override replaces the video selector entirely
         cookies_file=cookies.resolve(platform),
         format_override=AUDIO_FORMAT,
+        max_filesize_bytes=max(3 * max_size_bytes, _MIN_AUDIO_CEILING_BYTES),
     )
 
     entry = entries[0]
