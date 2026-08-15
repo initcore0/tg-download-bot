@@ -136,6 +136,29 @@ YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
 YTDLP_CHECK_TIMEOUT_S = 3
 
 
+def _version_tuple(version: str) -> tuple[int, ...] | None:
+    """yt-dlp's date-based version as comparable ints, or None for dev/odd builds."""
+    try:
+        return tuple(int(part) for part in version.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _version_is_older(installed: str, latest: str) -> bool:
+    """True only when `installed` is genuinely behind `latest`.
+
+    yt-dlp zero-pads its version ("2026.07.04") while PyPI normalizes it per PEP 440
+    ("2026.7.4"), so a raw string comparison cries wolf on every current install.
+    Compare numerically; a build that doesn't parse (dev/nightly) is treated as
+    current — a freshness hint must never false-alarm the admin.
+    """
+    installed_t = _version_tuple(installed)
+    latest_t = _version_tuple(latest)
+    if installed_t is None or latest_t is None:
+        return False
+    return installed_t < latest_t
+
+
 async def check_ytdlp_freshness() -> None:
     """Log a WARNING when the installed yt-dlp is behind the latest release on PyPI.
 
@@ -159,7 +182,7 @@ async def check_ytdlp_freshness() -> None:
             payload = await response.json()
 
         latest = payload["info"]["version"]
-        if latest != installed:
+        if _version_is_older(installed, latest):
             log.warning(
                 "yt-dlp %s is installed but %s is the latest release — extractors break "
                 "weekly; upgrade if downloads start failing",
