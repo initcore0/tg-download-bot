@@ -78,7 +78,7 @@ _AUTH_MARKERS = (
     "login required",
     "authorizationerror",
     "authentication",
-    "401",
+    "'401",
     "unauthorized",
     "account required",
     "logged-in",
@@ -93,16 +93,24 @@ _UNSUPPORTED_MARKERS = (
     "unsupported url",
     "no suitable extractor",
 )
+# Status codes are matched with the opening quote from gallery-dl's HttpError
+# format ("HttpError: '502 Bad Gateway' for '<url>'") — a bare "502" would also
+# match inside digit runs such as Instagram media IDs in the failing URL
+# (".../media/3920096595022470759/info/" contains "502").
 _TRANSIENT_MARKERS = (
-    "429",
+    "'429",
+    "'502",
+    "'503",
+    "'504",
     "rate limit",
     "too many requests",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
     "timed out",
     "connection reset",
     "temporary failure",
     "http error 5",
-    "502",
-    "503",
 )
 
 

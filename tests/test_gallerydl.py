@@ -84,6 +84,11 @@ class TestClassifyFailure:
             "[downloader.http][warning] HTTP Error 429: Too Many Requests",
             "rate limit exceeded, try again later",
             "connection to server timed out",
+            # gallery-dl's HttpError format: "'<code> <reason>' for '<url>'".
+            "[instagram][error] HttpError: '429 Too Many Requests' for 'https://u.rl/x'",
+            "[instagram][error] HttpError: '502 Bad Gateway' for 'https://u.rl/x'",
+            "[instagram][error] HttpError: '503 Service Unavailable' for 'https://u.rl/x'",
+            "[instagram][error] HttpError: '504 Gateway Timeout' for 'https://u.rl/x'",
         ],
     )
     def test_transient(self, stderr):
@@ -96,6 +101,29 @@ class TestClassifyFailure:
         assert isinstance(exc, ExtractionError)
         assert not isinstance(exc, TransientExtractionError)
         assert not isinstance(exc, gallerydl.AuthRequiredError)
+
+    def test_status_code_inside_media_id_is_not_transient(self):
+        # Regression: the media ID below contains "502"; with bare numeric markers
+        # this 400 Bad Request was misclassified as transient and pointlessly retried.
+        stderr = (
+            "[instagram][error] HttpError: '400 Bad Request' for "
+            "'https://www.instagram.com/api/v1/media/3920096595022470759/info/'"
+        )
+        exc = gallerydl.classify_failure(stderr, "https://www.instagram.com/p/x/")
+        assert isinstance(exc, ExtractionError)
+        assert not isinstance(exc, TransientExtractionError)
+        assert not isinstance(exc, gallerydl.AuthRequiredError)
+
+    def test_status_code_inside_media_id_is_not_auth(self):
+        # Same false-positive class for the auth bucket: "401" inside a digit run.
+        stderr = (
+            "[instagram][error] HttpError: '400 Bad Request' for "
+            "'https://www.instagram.com/api/v1/media/3920096540122470759/info/'"
+        )
+        exc = gallerydl.classify_failure(stderr, "https://www.instagram.com/p/x/")
+        assert isinstance(exc, ExtractionError)
+        assert not isinstance(exc, gallerydl.AuthRequiredError)
+        assert not isinstance(exc, TransientExtractionError)
 
 
 class TestCollectFiles:
