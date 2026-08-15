@@ -286,7 +286,8 @@ Neither can block startup: both are wrapped, log, and continue.
 - **`check_ytdlp_freshness()`** compares the installed `yt_dlp.version.__version__`
   against PyPI's latest (3s total timeout, aiohttp) and logs one WARNING when they
   differ, DEBUG when current. Extractors break weekly and a stale yt-dlp is the most
-  likely cause of a future "nothing downloads any more", so it is worth one log line.
+  likely cause of a future "nothing downloads any more", so it is worth one log line
+  — and one admin alert (§7.3), since nobody reads logs before the outage.
   Runs as a background `create_task` — never awaited in the startup path, cancelled in
   the shutdown `finally` — and any failure (no network, timeout, odd JSON) is swallowed
   at debug level.
@@ -344,6 +345,39 @@ disabled). Every other case does nothing at all — not even an error — so the
 existence isn't advertised. The admin id is compared in memory and never stored, so §6's
 anonymity guarantee is untouched.
 
+### 7.3 Admin alerts (`tgdl/bot/alerts.py`)
+
+The failures that matter operationally — a flagged Instagram session, YouTube
+bot-checks from a stale runtime, a broken ffmpeg — are invisible until a user
+complains. When `ADMIN_USER_ID` is set and `ADMIN_ALERTS` is on, the bot DMs the
+admin about them. Process-wide state in the style of `runtime.py`:
+`configure(bot, admin_user_id)` from `main.run()` (id 0, no bot, or `ADMIN_ALERTS=false`
+makes every function a no-op), `reset()` for tests.
+
+`report_failure(platform, error, url)` is the single hook, called from the two
+except blocks of each download flow alongside `_audit_failure`. It sorts failures
+into three tiers:
+
+- **Never alert**: `UnsupportedUrlError`, `MediaTooLargeError`. These are answers,
+  not outages; alerting on them would train the admin to ignore the channel.
+- **Immediate**: `TranscodeError` (ffmpeg is broken — *every* request is about to
+  fail) and any non-`DownloadError` exception (a bug in us). First occurrence alerts.
+- **Burst**: `TransientExtractionError`, `AuthRequiredError`, plain `ExtractionError`,
+  `DownloadTimeoutError` — failures healthy bots produce one at a time, where only
+  the *rate* is interesting. Occurrences are counted per `(platform, error class)` in
+  a 900s sliding window (timestamps pruned on every touch, so the map is bounded by
+  what is failing right now) and alert once 3 land inside it. `AuthRequiredError`
+  additionally says which platform's cookies to refresh.
+
+Every send passes a per-key cooldown (3600s), so an outage lasting all afternoon is
+one message an hour rather than one per failed request. Nothing here raises: an
+alert that cannot be delivered is a debug line, never a second incident. The startup
+freshness check (§6.2) uses the same `notify()` for a one-off "yt-dlp is stale".
+
+**Anonymity holds.** An alert carries the failing URL, platform, and error class/text
+— never user ids, chat ids, or chat types. The admin learns the bot is broken, not
+who was using it. The counters live in memory for the run and are never persisted.
+
 ## 8. Config (env / `.env` — see `.env.example`)
 
 ```
@@ -363,6 +397,8 @@ COOKIES              same, generic jar for platforms without a dedicated one
 *_COOKIES_FILE       file-path variant of each jar (COOKIES_FILE,
                      YOUTUBE_COOKIES_FILE, INSTAGRAM_COOKIES_FILE); content wins
 ADMIN_USER_ID        default 0 (disabled) — the only id allowed to run /stats (§7.2)
+ADMIN_ALERTS         default true — DM that admin when the bot is unhealthy (§7.3);
+                     false keeps /stats without the messages
 TELEGRAM_API_URL     default "" (Telegram's cloud API) — see §8.1
 ```
 

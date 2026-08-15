@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     # ever compared in memory — never stored, so the audit stays anonymous.
     admin_user_id: int = 0
 
+    # Whether the admin also receives DM alerts when the bot itself looks unhealthy
+    # (see tgdl/bot/alerts.py). Requires admin_user_id; set False to keep /stats
+    # without the messages.
+    admin_alerts: bool = True
+
     database_path: Path = Path("data/tgdl.db")
     download_dir: Path = Path("data/downloads")
     max_file_size_mb: int = 48

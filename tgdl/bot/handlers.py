@@ -33,7 +33,7 @@ from aiogram.types import (
 from aiogram.utils.chat_action import ChatActionSender
 
 from tgdl import i18n
-from tgdl.bot import responses, runtime
+from tgdl.bot import alerts, responses, runtime
 from tgdl.config import Settings
 from tgdl.downloader import audio as audio_mod
 from tgdl.downloader import service
@@ -193,6 +193,19 @@ async def _audit_failure(request_id: int | None, error: BaseException, elapsed_s
         await repo.mark_failure(request_id=request_id, error=error, elapsed_s=elapsed_s)
     except Exception:
         log.exception("audit: mark_failure failed")
+
+
+async def _alert_failure(url: str, error: BaseException) -> None:
+    """Tell the admin about a failure that suggests the *bot* is broken.
+
+    Same contract as the audit wrappers: diagnostics must never break the flow they
+    are diagnosing. `alerts` decides what is worth a message (most failures are not)
+    and stays anonymous — only the link, platform, and error travel.
+    """
+    try:
+        await alerts.report_failure(_safe_platform(url), error, url)
+    except Exception:
+        log.debug("admin alert failed", exc_info=True)
 
 
 # ----------------------------------------------------------------- file_id cache
@@ -543,11 +556,13 @@ async def _run_download(
         text = err.custom_message or i18n.t(err.message_key, locale)
         await _reply(message, text, quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
+        await _alert_failure(url, err)
     except Exception as err:
         # Top-level guard: an unexpected error must never kill the polling loop.
         log.exception("unexpected error handling %s", url)
         await _reply(message, responses.generic_error(locale), quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
+        await _alert_failure(url, err)
     finally:
         # The media (or the error reply) is the real answer, so the "I'm on it"
         # marker comes off either way.
@@ -691,10 +706,12 @@ async def _run_audio_download(
         text = err.custom_message or i18n.t(err.message_key, locale)
         await _reply(message, text, quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
+        await _alert_failure(url, err)
     except Exception as err:
         log.exception("unexpected error handling audio for %s", url)
         await _reply(message, responses.generic_error(locale), quote=quote)
         await _audit_failure(request_id, err, time.monotonic() - started)
+        await _alert_failure(url, err)
     finally:
         await _set_reaction(message, None)
         if workdir is not None:

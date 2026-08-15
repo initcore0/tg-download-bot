@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tgdl import main as main_mod
-from tgdl.bot import handlers, runtime
+from tgdl.bot import alerts, handlers, runtime
 from tgdl.config import Settings
 
 
@@ -436,6 +436,34 @@ class TestYtdlpFreshnessCheck:
             "2020.01.01" in r.message and "2099.12.31" in r.message
             for r in caplog.records
         )
+
+    async def test_a_stale_version_also_alerts_the_admin(self, monkeypatch):
+        """Nobody reads logs before the outage, so the admin is told once (§7.3)."""
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2020.01.01")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.31")
+        notify = AsyncMock()
+        monkeypatch.setattr(main_mod.alerts, "notify", notify)
+
+        await main_mod.check_ytdlp_freshness()
+
+        notify.assert_awaited_once()
+        key, text = notify.await_args.args
+        assert key == "ytdlp-stale"
+        assert "2020.01.01" in text and "2099.12.31" in text
+
+    async def test_a_current_version_does_not_alert(self, monkeypatch):
+        import yt_dlp.version
+
+        monkeypatch.setattr(yt_dlp.version, "__version__", "2099.12.31")
+        self._stub_aiohttp(monkeypatch, latest="2099.12.31")
+        notify = AsyncMock()
+        monkeypatch.setattr(main_mod.alerts, "notify", notify)
+
+        await main_mod.check_ytdlp_freshness()
+
+        notify.assert_not_awaited()
 
     async def test_silent_when_current(self, monkeypatch, caplog):
         import yt_dlp.version
@@ -867,3 +895,107 @@ class TestSelfHostedBotApi:
 
         assert await main_mod._healthcheck(settings) == 0
         assert bot_cls.call_args.kwargs["session"] is None
+
+
+class TestAdminAlertWiring:
+    """main.run() must configure alerting before anything can want to alert (§7.3)."""
+
+    async def _run(self, monkeypatch, tmp_path, settings):
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            main_mod.repo, "prune_audit",
+            AsyncMock(return_value={"deleted": 0, "stale_pending": 0}),
+        )
+        monkeypatch.setattr(main_mod, "check_ytdlp_freshness", AsyncMock())
+
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock()
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+        await main_mod.run(settings)
+        return bot
+
+    @pytest.fixture(autouse=True)
+    def _reset_alerts(self):
+        alerts.reset()
+        yield
+        alerts.reset()
+
+    async def test_enabled_when_an_admin_id_is_configured(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            database_path=tmp_path / "db.sqlite",
+            admin_user_id=555,
+        )
+
+        await self._run(monkeypatch, tmp_path, settings)
+
+        assert alerts.enabled() is True
+
+    async def test_disabled_without_an_admin_id(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC", database_path=tmp_path / "db.sqlite"
+        )
+
+        await self._run(monkeypatch, tmp_path, settings)
+
+        assert alerts.enabled() is False
+
+    async def test_admin_alerts_false_keeps_stats_without_dms(self, monkeypatch, tmp_path):
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            database_path=tmp_path / "db.sqlite",
+            admin_user_id=555,
+            admin_alerts=False,
+        )
+
+        await self._run(monkeypatch, tmp_path, settings)
+
+        assert alerts.enabled() is False
+        assert settings.admin_user_id == 555  # /stats is untouched
+
+    async def test_configure_runs_before_the_freshness_task(self, monkeypatch, tmp_path):
+        """The freshness check alerts, so it must not start before configure()."""
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            database_path=tmp_path / "db.sqlite",
+            admin_user_id=555,
+        )
+        seen: list[bool] = []
+
+        async def _check():
+            seen.append(alerts.enabled())
+
+        monkeypatch.setattr(main_mod.repo, "init_db", AsyncMock())
+        monkeypatch.setattr(main_mod.repo, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            main_mod.repo, "prune_audit",
+            AsyncMock(return_value={"deleted": 0, "stale_pending": 0}),
+        )
+        monkeypatch.setattr(main_mod, "check_ytdlp_freshness", _check)
+
+        bot = MagicMock()
+        bot.me = AsyncMock(return_value=SimpleNamespace(username="mybot", id=1))
+        bot.delete_webhook = AsyncMock()
+        bot.session.close = AsyncMock()
+        monkeypatch.setattr(main_mod, "Bot", MagicMock(return_value=bot))
+
+        async def _poll(*args, **kwargs):
+            await asyncio.sleep(0)  # let the background task run
+
+        dispatcher = MagicMock()
+        dispatcher.start_polling = AsyncMock(side_effect=_poll)
+        dispatcher.__setitem__ = MagicMock()
+        monkeypatch.setattr(main_mod, "Dispatcher", MagicMock(return_value=dispatcher))
+
+        await main_mod.run(settings)
+
+        assert seen == [True]
